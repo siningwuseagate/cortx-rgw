@@ -10,7 +10,7 @@
 #include "rgw_notify_event_type.h"
 #include <boost/container/flat_map.hpp>
 
-namespace rgw::sal { class RadosStore; }
+namespace rgw::sal { class Store; }
 
 class XMLObj;
 
@@ -599,32 +599,33 @@ class RGWPubSub
 {
   friend class Bucket;
 
-  rgw::sal::RadosStore* store;
+  rgw::sal::Store* store;
   const std::string tenant;
-  RGWSysObjectCtx obj_ctx;
+  RGWSysObjectCtx *obj_ctx{nullptr};
 
-  rgw_raw_obj meta_obj;
+  //rgw_raw_obj meta_obj;
+  std::string meta_oid;
 
-  std::string meta_oid() const {
+  std::string get_meta_oid() const {
     return pubsub_oid_prefix + tenant;
   }
 
-  std::string bucket_meta_oid(const rgw_bucket& bucket) const {
+  std::string get_bucket_meta_oid(const rgw_bucket& bucket) const {
     return pubsub_oid_prefix + tenant + ".bucket." + bucket.name + "/" + bucket.marker;
   }
 
-  std::string sub_meta_oid(const std::string& name) const {
+  std::string get_sub_meta_oid(const std::string& name) const {
     return pubsub_oid_prefix + tenant + ".sub." + name;
   }
 
   template <class T>
-  int read(const rgw_raw_obj& obj, T* data, RGWObjVersionTracker* objv_tracker);
+  int read(const std::string& oid, T* data, RGWObjVersionTracker* objv_tracker);
 
   template <class T>
-  int write(const DoutPrefixProvider *dpp, const rgw_raw_obj& obj, const T& info,
+  int write(const DoutPrefixProvider *dpp, const std::string& oid, const T& info,
 	    RGWObjVersionTracker* obj_tracker, optional_yield y);
 
-  int remove(const DoutPrefixProvider *dpp, const rgw_raw_obj& obj, RGWObjVersionTracker* objv_tracker,
+  int remove(const DoutPrefixProvider *dpp, const std::string& oid, RGWObjVersionTracker* objv_tracker,
 	     optional_yield y);
 
   int read_topics(rgw_pubsub_topics *result, RGWObjVersionTracker* objv_tracker);
@@ -632,13 +633,14 @@ class RGWPubSub
 			RGWObjVersionTracker* objv_tracker, optional_yield y);
 
 public:
-  RGWPubSub(rgw::sal::RadosStore* _store, const std::string& tenant);
+  RGWPubSub(rgw::sal::Store* _store, const std::string& tenant);
 
   class Bucket {
     friend class RGWPubSub;
     RGWPubSub *ps;
     rgw_bucket bucket;
-    rgw_raw_obj bucket_meta_obj;
+    //rgw_raw_obj bucket_meta_obj;
+    std::string bucket_meta_oid;
 
     // read the list of topics associated with a bucket and populate into result
     // use version tacker to enforce atomicity between read/write
@@ -651,7 +653,7 @@ public:
 		     RGWObjVersionTracker* objv_tracker, optional_yield y);
   public:
     Bucket(RGWPubSub *_ps, const rgw_bucket& _bucket) : ps(_ps), bucket(_bucket) {
-      ps->get_bucket_meta_obj(bucket, &bucket_meta_obj);
+      bucket_meta_oid = ps->get_bucket_meta_oid(bucket);
     }
 
     // read the list of topics associated with a bucket and populate into result
@@ -681,7 +683,8 @@ public:
   protected:
     RGWPubSub* const ps;
     const std::string sub;
-    rgw_raw_obj sub_meta_obj;
+    //rgw_raw_obj sub_meta_obj;
+    std::string sub_meta_oid;
 
     int read_sub(rgw_pubsub_sub_config *result, RGWObjVersionTracker* objv_tracker);
     int write_sub(const DoutPrefixProvider *dpp, const rgw_pubsub_sub_config& sub_conf,
@@ -689,7 +692,7 @@ public:
     int remove_sub(const DoutPrefixProvider *dpp, RGWObjVersionTracker* objv_tracker, optional_yield y);
   public:
     Sub(RGWPubSub *_ps, const std::string& _sub) : ps(_ps), sub(_sub) {
-      ps->get_sub_meta_obj(sub, &sub_meta_obj);
+      sub_meta_oid = ps->get_sub_meta_oid(sub);
     }
 
     virtual ~Sub() = default;
@@ -752,7 +755,6 @@ public:
 
   void get_meta_obj(rgw_raw_obj *obj) const;
   void get_bucket_meta_obj(const rgw_bucket& bucket, rgw_raw_obj *obj) const;
-
   void get_sub_meta_obj(const std::string& name, rgw_raw_obj *obj) const;
 
   // get all topics (per tenant, if used)) and populate them into "result"
@@ -782,14 +784,14 @@ public:
 
 
 template <class T>
-int RGWPubSub::read(const rgw_raw_obj& obj, T* result, RGWObjVersionTracker* objv_tracker)
+int RGWPubSub::read(const std::string& oid, T* result, RGWObjVersionTracker* objv_tracker)
 {
   bufferlist bl;
-  int ret = rgw_get_system_obj(obj_ctx,
-                               obj.pool, obj.oid,
+  int ret = store->pubsub_read(obj_ctx,
+                               oid,
                                bl,
                                objv_tracker,
-                               nullptr, null_yield, nullptr, nullptr);
+                               null_yield);
   if (ret < 0) {
     return ret;
   }
@@ -805,21 +807,15 @@ int RGWPubSub::read(const rgw_raw_obj& obj, T* result, RGWObjVersionTracker* obj
 }
 
 template <class T>
-int RGWPubSub::write(const DoutPrefixProvider *dpp, const rgw_raw_obj& obj, const T& info,
+int RGWPubSub::write(const DoutPrefixProvider *dpp, const std::string& oid, const T& info,
 			 RGWObjVersionTracker* objv_tracker, optional_yield y)
 {
   bufferlist bl;
   encode(info, bl);
 
-  int ret = rgw_put_system_obj(dpp, obj_ctx, obj.pool, obj.oid,
-			       bl, false, objv_tracker,
-			       real_time(), y);
-  if (ret < 0) {
-    return ret;
-  }
-
-  obj_ctx.invalidate(obj);
-  return 0;
+  return store->pubsub_write(dpp, obj_ctx, oid,
+                             bl, false, objv_tracker,
+                             real_time(), y);
 }
 
 #endif

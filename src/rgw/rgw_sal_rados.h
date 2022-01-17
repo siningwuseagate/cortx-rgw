@@ -479,6 +479,17 @@ class RadosStore : public Store {
       luarocks_path = path;
     }
 
+    virtual int pubsub_read(RGWSysObjectCtx* obj_ctx,
+                            const std::string& oid, bufferlist& bl,
+                            RGWObjVersionTracker *objv_tracker, optional_yield y) override;
+    virtual int pubsub_write(const DoutPrefixProvider *dpp, RGWSysObjectCtx* obj_ctx,
+                             const std::string& oid, bufferlist& bl,
+                             bool exclusive, RGWObjVersionTracker *objv_tracker,
+                             real_time set_mtime, optional_yield y) override;
+    virtual int pubsub_delete(const DoutPrefixProvider *dpp, 
+                              const std::string& oid,
+                              RGWObjVersionTracker *objv_tracker, optional_yield y) override;
+
     /* Unique to RadosStore */
     int get_obj_head_ioctx(const DoutPrefixProvider *dpp, const RGWBucketInfo& bucket_info, const rgw_obj& obj,
 			   librados::IoCtx* ioctx);

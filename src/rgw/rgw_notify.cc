@@ -683,7 +683,7 @@ static inline void populate_event(reservation_t& res,
   event.eventName = to_event_string(event_type);
   event.userIdentity = res.user_id;    // user that triggered the change
   event.x_amz_request_id = res.req_id; // request ID of the original change
-  event.x_amz_id_2 = res.store->getRados()->host_id; // RGW on which the change was made
+  event.x_amz_id_2 = static_cast<rgw::sal::RadosStore*>(res.store)->getRados()->host_id; // RGW on which the change was made
   // configurationId is filled from notification configuration
   event.bucket_name = res.bucket->get_name();
   event.bucket_ownerIdentity = res.bucket->get_owner()->get_id().id;
@@ -692,7 +692,7 @@ static inline void populate_event(reservation_t& res,
   event.object_size = size;
   event.object_etag = etag;
   event.object_versionId = version;
-  event.awsRegion = res.store->get_zone()->get_zonegroup().api_name;
+  event.awsRegion = static_cast<rgw::sal::RadosStore*>(res.store)->get_zone()->get_zonegroup().api_name;
   // use timestamp as per key sequence id (hex encoded)
   const utime_t ts(real_clock::now());
   boost::algorithm::hex((const char*)&ts, (const char*)&ts + sizeof(utime_t), 
@@ -804,7 +804,7 @@ static inline bool notification_match(reservation_t& res,
       const auto& queue_name = topic_cfg.dest.arn_topic;
       cls_2pc_queue_reserve(op, res.size, 1, &obl, &rval);
       auto ret = rgw_rados_operate(
-	res.dpp, res.store->getRados()->get_notif_pool_ctx(),
+	res.dpp, static_cast<rgw::sal::RadosStore*>(res.store)->getRados()->get_notif_pool_ctx(),
 	queue_name, &op, res.yield, librados::OPERATION_RETURNVEC);
       if (ret < 0) {
         ldpp_dout(res.dpp, 1) <<
@@ -862,7 +862,7 @@ int publish_commit(rgw::sal::Object* obj,
         librados::ObjectWriteOperation op;
         cls_2pc_queue_abort(op, topic.res_id);
         auto ret = rgw_rados_operate(
-	  dpp, res.store->getRados()->get_notif_pool_ctx(),
+	  dpp, static_cast<rgw::sal::RadosStore*>(res.store)->getRados()->get_notif_pool_ctx(),
 	  topic.cfg.dest.arn_topic, &op,
 	  res.yield);
         if (ret < 0) {
@@ -877,7 +877,7 @@ int publish_commit(rgw::sal::Object* obj,
         int rval;
         cls_2pc_queue_reserve(op, bl.length(), 1, &obl, &rval);
         ret = rgw_rados_operate(
-	  dpp, res.store->getRados()->get_notif_pool_ctx(),
+	  dpp, static_cast<rgw::sal::RadosStore*>(res.store)->getRados()->get_notif_pool_ctx(),
           queue_name, &op, res.yield, librados::OPERATION_RETURNVEC);
         if (ret < 0) {
           ldpp_dout(dpp, 1) << "ERROR: failed to reserve extra space on queue: "
@@ -896,7 +896,7 @@ int publish_commit(rgw::sal::Object* obj,
       librados::ObjectWriteOperation op;
       cls_2pc_queue_commit(op, bl_data_vec, topic.res_id);
       const auto ret = rgw_rados_operate(
-	dpp, res.store->getRados()->get_notif_pool_ctx(),
+	dpp, static_cast<rgw::sal::RadosStore*>(res.store)->getRados()->get_notif_pool_ctx(),
 	queue_name, &op, res.yield);
       topic.res_id = cls_2pc_reservation::NO_ID;
       if (ret < 0) {
@@ -947,7 +947,7 @@ extern int publish_abort(reservation_t& res) {
     librados::ObjectWriteOperation op;
     cls_2pc_queue_abort(op, topic.res_id);
     const auto ret = rgw_rados_operate(
-      res.dpp, res.store->getRados()->get_notif_pool_ctx(),
+      res.dpp, static_cast<rgw::sal::RadosStore*>(res.store)->getRados()->get_notif_pool_ctx(),
       queue_name, &op, res.yield);
     if (ret < 0) {
       ldpp_dout(res.dpp, 1) << "ERROR: failed to abort reservation: "
@@ -961,7 +961,7 @@ extern int publish_abort(reservation_t& res) {
 }
 
 reservation_t::reservation_t(const DoutPrefixProvider* _dpp,
-			     rgw::sal::RadosStore* _store,
+			     rgw::sal::Store* _store,
 			     req_state* _s,
 			     rgw::sal::Object* _object,
 			     rgw::sal::Object* _src_object,
@@ -978,7 +978,7 @@ reservation_t::reservation_t(const DoutPrefixProvider* _dpp,
 {}
 
 reservation_t::reservation_t(const DoutPrefixProvider* _dpp,
-			     rgw::sal::RadosStore* _store,
+			     rgw::sal::Store* _store,
 			     RGWObjectCtx* _obj_ctx,
 			     rgw::sal::Object* _object,
 			     rgw::sal::Object* _src_object,

@@ -403,6 +403,18 @@ class Store {
     virtual const std::string& get_luarocks_path() const = 0;
     /** Set the location of where lua packages are installed */
     virtual void set_luarocks_path(const std::string& path) = 0;
+
+    /** Read pubsub from store. */
+    virtual int pubsub_read(RGWSysObjectCtx* obj_ctx,
+                            const std::string& oid, bufferlist& bl,
+                            RGWObjVersionTracker *objv_tracker, optional_yield y) = 0;
+    virtual int pubsub_write(const DoutPrefixProvider *dpp, RGWSysObjectCtx* obj_ctx,
+                             const std::string& oid, bufferlist& data,
+                             bool exclusive, RGWObjVersionTracker *objv_tracker,
+                             real_time set_mtime, optional_yield y) = 0;
+    virtual int pubsub_delete(const DoutPrefixProvider *dpp, 
+                              const std::string& oid,
+                              RGWObjVersionTracker *objv_tracker, optional_yield y) = 0;
 };
 
 /**

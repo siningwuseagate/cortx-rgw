@@ -38,6 +38,7 @@ class MotrStore;
 #define RGW_MOTR_USERS_IDX_NAME       "motr.rgw.users"
 #define RGW_MOTR_BUCKET_INST_IDX_NAME "motr.rgw.bucket.instances"
 #define RGW_MOTR_BUCKET_HD_IDX_NAME   "motr.rgw.bucket.headers"
+#define RGW_MOTR_PUBSUB_IDX_NAME       "motr.rgw.pubsub"
 //#define RGW_MOTR_BUCKET_ACL_IDX_NAME  "motr.rgw.bucket.acls"
 
 // A simplified metadata cache implementation.
@@ -132,14 +133,25 @@ struct MotrUserInfo {
 WRITE_CLASS_ENCODER(MotrUserInfo);
 
 class MotrNotification : public Notification {
+  MotrStore* store;
+  rgw::notify::reservation_t res;
+
   public:
-    MotrNotification(Object* _obj, Object* _src_obj, rgw::notify::EventType _type) :
-        Notification(_obj, _src_obj, _type) {}
+    MotrNotification(const DoutPrefixProvider* _dpp, MotrStore* _store, Object* _obj, Object* _src_obj, req_state* _s, rgw::notify::EventType _type, const std::string* object_name=nullptr) :
+      Notification(_obj, _src_obj, _type), store(_store), res(_dpp, (rgw::sal::Store*)_store, _s, _obj, _src_obj, object_name) { }
+
+    MotrNotification(const DoutPrefixProvider* _dpp, MotrStore* _store, Object* _obj, Object* _src_obj, RGWObjectCtx* rctx, rgw::notify::EventType _type, rgw::sal::Bucket* _bucket, std::string& _user_id, std::string& _user_tenant, std::string& _req_id, optional_yield y) :
+      Notification(_obj, _src_obj, _type), store(_store), res(_dpp, (rgw::sal::Store*)_store, rctx, _obj, _src_obj, _bucket, _user_id, _user_tenant, _req_id, y) {}
+  
     ~MotrNotification() = default;
 
-    virtual int publish_reserve(const DoutPrefixProvider *dpp, RGWObjTags* obj_tags = nullptr) override { return 0;}
+    rgw::notify::reservation_t& get_reservation(void) {
+      return res;
+    }
+    
+    virtual int publish_reserve(const DoutPrefixProvider *dpp, RGWObjTags* obj_tags = nullptr) override;
     virtual int publish_commit(const DoutPrefixProvider* dpp, uint64_t size,
-			       const ceph::real_time& mtime, const std::string& etag, const std::string& version) override { return 0; }
+			       const ceph::real_time& mtime, const std::string& etag, const std::string& version) override;
 };
 
 class MotrUser : public User {
@@ -937,6 +949,16 @@ class MotrStore : public Store {
     virtual void set_luarocks_path(const std::string& path) override {
       luarocks_path = path;
     }
+
+    virtual int pubsub_read(RGWSysObjectCtx* obj_ctx,
+                            const std::string& oid, bufferlist& bl,
+                            RGWObjVersionTracker *objv_tracker, optional_yield y) override;
+    virtual int pubsub_write(const DoutPrefixProvider *dpp, RGWSysObjectCtx* obj_ctx,
+                             const std::string& oid, bufferlist& data,
+                             bool exclusive, RGWObjVersionTracker *objv_tracker,
+                             real_time set_mtime, optional_yield y) override;
+    virtual int pubsub_delete(const DoutPrefixProvider *dpp, const std::string& oid,
+                              RGWObjVersionTracker *objv_tracker, optional_yield y) override;
 
     int open_idx(struct m0_uint128 *id, bool create, struct m0_idx *out);
     void close_idx(struct m0_idx *idx) { m0_idx_fini(idx); }

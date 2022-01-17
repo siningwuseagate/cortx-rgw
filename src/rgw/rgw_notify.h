@@ -55,7 +55,7 @@ struct reservation_t {
 
   const DoutPrefixProvider* dpp;
   std::vector<topic_t> topics;
-  rgw::sal::RadosStore* const store;
+  rgw::sal::Store* const store;
   const req_state* const s;
   size_t size;
   RGWObjectCtx* obj_ctx;
@@ -72,7 +72,7 @@ struct reservation_t {
 
   /* ctor for rgw_op callers */
   reservation_t(const DoutPrefixProvider* _dpp,
-		rgw::sal::RadosStore* _store,
+		rgw::sal::Store* _store,
 		req_state* _s,
 		rgw::sal::Object* _object,
 		rgw::sal::Object* _src_object,
@@ -80,7 +80,7 @@ struct reservation_t {
 
   /* ctor for non-request caller (e.g., lifecycle) */
   reservation_t(const DoutPrefixProvider* _dpp,
-		rgw::sal::RadosStore* _store,
+		rgw::sal::Store* _store,
 		RGWObjectCtx* _obj_ctx,
 		rgw::sal::Object* _object,
 		rgw::sal::Object* _src_object,

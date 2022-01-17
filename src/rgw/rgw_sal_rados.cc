@@ -1447,6 +1447,38 @@ std::unique_ptr<Writer> RadosStore::get_atomic_writer(const DoutPrefixProvider *
 				 olh_epoch, unique_tag);
 }
 
+int RadosStore::pubsub_read(RGWSysObjectCtx* obj_ctx,
+                            const std::string& oid, bufferlist& bl,
+                            RGWObjVersionTracker *objv_tracker, optional_yield y)
+{
+  auto pool = this->svc()->zone->get_zone_params().log_pool;
+  return rgw_get_system_obj(*obj_ctx, pool, oid, bl,
+                            objv_tracker, nullptr, null_yield, nullptr, nullptr);
+}
+
+int RadosStore::pubsub_write(const DoutPrefixProvider *dpp, RGWSysObjectCtx* obj_ctx,
+                             const std::string& oid, bufferlist& bl,
+                             bool exclusive, RGWObjVersionTracker *objv_tracker,
+                             real_time set_mtime, optional_yield y)
+{
+  auto pool = this->svc()->zone->get_zone_params().log_pool;
+  int ret = rgw_put_system_obj(dpp, *obj_ctx, pool, oid,
+                               bl, exclusive, objv_tracker, real_time(), y);
+  if (ret == 0) {
+    auto raw_obj = rgw_raw_obj(pool, oid);
+    obj_ctx->invalidate(raw_obj);
+  }
+  return ret;
+}
+
+int RadosStore::pubsub_delete(const DoutPrefixProvider *dpp, 
+                              const std::string& oid,
+                              RGWObjVersionTracker *objv_tracker, optional_yield y)
+{
+  auto pool = this->svc()->zone->get_zone_params().log_pool;
+  return rgw_delete_system_obj(dpp, this->svc()->sysobj, pool, oid, objv_tracker, y);
+}
+
 int RadosStore::get_obj_head_ioctx(const DoutPrefixProvider *dpp, const RGWBucketInfo& bucket_info, const rgw_obj& obj, librados::IoCtx* ioctx)
 {
   return rados->get_obj_head_ioctx(dpp, bucket_info, obj, ioctx);

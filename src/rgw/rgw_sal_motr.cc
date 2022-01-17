@@ -54,7 +54,8 @@ using ::ceph::decode;
 static std::string motr_global_indices[] = {
   RGW_MOTR_USERS_IDX_NAME,
   RGW_MOTR_BUCKET_INST_IDX_NAME,
-  RGW_MOTR_BUCKET_HD_IDX_NAME
+  RGW_MOTR_BUCKET_HD_IDX_NAME,
+  RGW_MOTR_PUBSUB_IDX_NAME
 };
 
 void MotrMetaCache::invalid(const DoutPrefixProvider *dpp,
@@ -146,6 +147,18 @@ int MotrMetaCache::watch_cb(const DoutPrefixProvider *dpp,
 void MotrMetaCache::set_enabled(bool status)
 {
   cache.set_enabled(status);
+}
+
+int MotrNotification::publish_reserve(const DoutPrefixProvider *dpp, RGWObjTags* obj_tags)
+{
+  return rgw::notify::publish_reserve(dpp, event_type, res, obj_tags);
+}
+
+int MotrNotification::publish_commit(const DoutPrefixProvider* dpp, uint64_t size,
+                                     const ceph::real_time& mtime, const std::string& etag,
+                                     const std::string& version)
+{
+  return rgw::notify::publish_commit(obj, size, mtime, etag, version, event_type, res, dpp);
 }
 
 // TODO: properly handle the number of key/value pairs to get in
@@ -2909,14 +2922,14 @@ std::unique_ptr<Completions> MotrStore::get_completions(void)
 std::unique_ptr<Notification> MotrStore::get_notification(Object* obj, Object* src_obj, struct req_state* s,
     rgw::notify::EventType event_type, const string* object_name)
 {
-  return std::make_unique<MotrNotification>(obj, src_obj, event_type);
+  return std::make_unique<MotrNotification>(s, this, obj, src_obj, s, event_type, object_name);
 }
 
 std::unique_ptr<Notification>  MotrStore::get_notification(const DoutPrefixProvider* dpp, Object* obj,
         Object* src_obj, RGWObjectCtx* rctx, rgw::notify::EventType event_type, rgw::sal::Bucket* _bucket,
         std::string& _user_id, std::string& _user_tenant, std::string& _req_id, optional_yield y)
 {
-  return std::make_unique<MotrNotification>(obj, src_obj, event_type);
+  return std::make_unique<MotrNotification>(dpp, this, obj, src_obj, rctx, event_type, _bucket, _user_id, _user_tenant, _req_id, y);
 }
 
 int MotrStore::log_usage(const DoutPrefixProvider *dpp, map<rgw_user_bucket, RGWUsageBatch>& usage_info)
@@ -3001,6 +3014,29 @@ std::string MotrStore::meta_get_marker(void* handle)
 int MotrStore::meta_remove(const DoutPrefixProvider *dpp, string& metadata_key, optional_yield y)
 {
   return 0;
+}
+
+int MotrStore::pubsub_read(RGWSysObjectCtx* obj_ctx,
+                           const std::string& oid, bufferlist& bl,
+                           RGWObjVersionTracker *objv_tracker, optional_yield y)
+{
+  return this->do_idx_op_by_name(RGW_MOTR_PUBSUB_IDX_NAME, M0_IC_GET, oid, bl);
+}
+
+int MotrStore::pubsub_write(const DoutPrefixProvider *dpp, RGWSysObjectCtx* obj_ctx,
+                            const std::string& oid, bufferlist& data,
+                            bool exclusive, RGWObjVersionTracker *objv_tracker,
+                              real_time set_mtime, optional_yield y)
+{
+  return this->do_idx_op_by_name(RGW_MOTR_PUBSUB_IDX_NAME, M0_IC_PUT, oid, data);
+}
+
+int MotrStore::pubsub_delete(const DoutPrefixProvider *dpp, 
+                             const std::string& oid,
+                             RGWObjVersionTracker *objv_tracker, optional_yield y)
+{
+  bufferlist bl;
+  return this->do_idx_op_by_name(RGW_MOTR_PUBSUB_IDX_NAME, M0_IC_DEL, oid, bl);
 }
 
 int MotrStore::open_idx(struct m0_uint128 *id, bool create, struct m0_idx *idx)

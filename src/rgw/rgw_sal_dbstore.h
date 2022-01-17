@@ -805,6 +805,17 @@ public:
         luarocks_path = path;
       }
 
+      virtual int pubsub_read(RGWSysObjectCtx* obj_ctx,
+                              const std::string& oid, bufferlist& bl,
+                              RGWObjVersionTracker *objv_tracker, optional_yield y) override;
+      virtual int pubsub_write(const DoutPrefixProvider *dpp, RGWSysObjectCtx* obj_ctx,
+                               const std::string& oid, bufferlist& data,
+                               bool exclusive, RGWObjVersionTracker *objv_tracker,
+                               real_time set_mtime, optional_yield y) override;
+      virtual int pubsub_delete(const DoutPrefixProvider *dpp, 
+                                const std::string& oid,
+                                RGWObjVersionTracker *objv_tracker, optional_yield y) override;
+
       /* Unique to DBStore */
       void setDBStoreManager(DBStoreManager *stm) { dbsm = stm; }
       DBStoreManager *getDBStoreManager(void) { return dbsm; }

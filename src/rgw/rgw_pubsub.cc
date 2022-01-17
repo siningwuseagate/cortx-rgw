@@ -435,19 +435,21 @@ void rgw_pubsub_sub_config::dump(Formatter *f) const
   encode_json("s3_id", s3_id, f);
 }
 
-RGWPubSub::RGWPubSub(rgw::sal::RadosStore* _store, const std::string& _tenant) :
-                            store(_store),
-                            tenant(_tenant),
-                            obj_ctx(store->svc()->sysobj->init_obj_ctx()) {
-    get_meta_obj(&meta_obj);
+RGWPubSub::RGWPubSub(rgw::sal::Store* _store, const std::string& _tenant):
+	store(_store), tenant(_tenant)
+{
+  if (strcmp(store->get_name(), "rados") == 0) {
+    obj_ctx = new RGWSysObjectCtx(static_cast<rgw::sal::RadosStore*>(store)->svc()->sysobj->init_obj_ctx());
+  }
+  meta_oid = get_meta_oid();
 }
 
 int RGWPubSub::remove(const DoutPrefixProvider *dpp, 
-                          const rgw_raw_obj& obj,
-			  RGWObjVersionTracker *objv_tracker,
-			  optional_yield y)
+                      const std::string& oid,
+                      RGWObjVersionTracker *objv_tracker,
+                      optional_yield y)
 {
-  int ret = rgw_delete_system_obj(dpp, store->svc()->sysobj, obj.pool, obj.oid, objv_tracker, y);
+  int ret = store->pubsub_delete(dpp, oid, objv_tracker, y);
   if (ret < 0) {
     return ret;
   }
@@ -457,7 +459,7 @@ int RGWPubSub::remove(const DoutPrefixProvider *dpp,
 
 int RGWPubSub::read_topics(rgw_pubsub_topics *result, RGWObjVersionTracker *objv_tracker)
 {
-  int ret = read(meta_obj, result, objv_tracker);
+  int ret = read(meta_oid, result, objv_tracker);
   if (ret < 0) {
     ldout(store->ctx(), 10) << "WARNING: failed to read topics info: ret=" << ret << dendl;
     return ret;
@@ -468,7 +470,7 @@ int RGWPubSub::read_topics(rgw_pubsub_topics *result, RGWObjVersionTracker *objv
 int RGWPubSub::write_topics(const DoutPrefixProvider *dpp, const rgw_pubsub_topics& topics,
 				     RGWObjVersionTracker *objv_tracker, optional_yield y)
 {
-  int ret = write(dpp, meta_obj, topics, objv_tracker, y);
+  int ret = write(dpp, meta_oid, topics, objv_tracker, y);
   if (ret < 0 && ret != -ENOENT) {
     ldpp_dout(dpp, 1) << "ERROR: failed to write topics info: ret=" << ret << dendl;
     return ret;
@@ -483,7 +485,7 @@ int RGWPubSub::get_topics(rgw_pubsub_topics *result)
 
 int RGWPubSub::Bucket::read_topics(rgw_pubsub_bucket_topics *result, RGWObjVersionTracker *objv_tracker)
 {
-  int ret = ps->read(bucket_meta_obj, result, objv_tracker);
+  int ret = ps->read(bucket_meta_oid, result, objv_tracker);
   if (ret < 0 && ret != -ENOENT) {
     ldout(ps->store->ctx(), 1) << "ERROR: failed to read bucket topics info: ret=" << ret << dendl;
     return ret;
@@ -495,7 +497,7 @@ int RGWPubSub::Bucket::write_topics(const DoutPrefixProvider *dpp, const rgw_pub
 					RGWObjVersionTracker *objv_tracker,
 					optional_yield y)
 {
-  int ret = ps->write(dpp, bucket_meta_obj, topics, objv_tracker, y);
+  int ret = ps->write(dpp, bucket_meta_oid, topics, objv_tracker, y);
   if (ret < 0) {
     ldout(ps->store->ctx(), 1) << "ERROR: failed to write bucket topics info: ret=" << ret << dendl;
     return ret;
@@ -615,7 +617,7 @@ int RGWPubSub::Bucket::remove_notification(const DoutPrefixProvider *dpp, const 
 
   if (bucket_topics.topics.empty()) {
     // no more topics - delete the notification object of the bucket
-    ret = ps->remove(dpp, bucket_meta_obj, &objv_tracker, y);
+    ret = ps->remove(dpp, bucket_meta_oid, &objv_tracker, y);
     if (ret < 0 && ret != -ENOENT) {
       ldpp_dout(dpp, 1) << "ERROR: failed to remove bucket topics: ret=" << ret << dendl;
       return ret;
@@ -653,7 +655,7 @@ int RGWPubSub::Bucket::remove_notifications(const DoutPrefixProvider *dpp, optio
   }
 
   // delete the notification object of the bucket
-  ret = ps->remove(dpp, bucket_meta_obj, nullptr, y);
+  ret = ps->remove(dpp, bucket_meta_oid, nullptr, y);
   if (ret < 0 && ret != -ENOENT) {
     ldpp_dout(dpp, 1) << "ERROR: failed to remove bucket topics: ret=" << ret << dendl;
     return ret;
@@ -721,7 +723,7 @@ int RGWPubSub::remove_topic(const DoutPrefixProvider *dpp, const string& name, o
 
 int RGWPubSub::Sub::read_sub(rgw_pubsub_sub_config *result, RGWObjVersionTracker *objv_tracker)
 {
-  int ret = ps->read(sub_meta_obj, result, objv_tracker);
+  int ret = ps->read(sub_meta_oid, result, objv_tracker);
   if (ret < 0 && ret != -ENOENT) {
     ldout(ps->store->ctx(), 1) << "ERROR: failed to read subscription info: ret=" << ret << dendl;
     return ret;
@@ -734,7 +736,7 @@ int RGWPubSub::Sub::write_sub(const DoutPrefixProvider *dpp,
 				  RGWObjVersionTracker *objv_tracker,
 				  optional_yield y)
 {
-  int ret = ps->write(dpp, sub_meta_obj, sub_conf, objv_tracker, y);
+  int ret = ps->write(dpp, sub_meta_oid, sub_conf, objv_tracker, y);
   if (ret < 0) {
     ldpp_dout(dpp, 1) << "ERROR: failed to write subscription info: ret=" << ret << dendl;
     return ret;
@@ -746,7 +748,7 @@ int RGWPubSub::Sub::write_sub(const DoutPrefixProvider *dpp,
 int RGWPubSub::Sub::remove_sub(const DoutPrefixProvider *dpp, RGWObjVersionTracker *objv_tracker,
 				   optional_yield y)
 {
-  int ret = ps->remove(dpp, sub_meta_obj, objv_tracker, y);
+  int ret = ps->remove(dpp, sub_meta_oid, objv_tracker, y);
   if (ret < 0) {
     ldpp_dout(dpp, 1) << "ERROR: failed to remove subscription info: ret=" << ret << dendl;
     return ret;
@@ -863,7 +865,11 @@ void RGWPubSub::SubWithEvents<EventType>::list_events_result::dump(Formatter *f)
 template<typename EventType>
 int RGWPubSub::SubWithEvents<EventType>::list_events(const DoutPrefixProvider *dpp, const string& marker, int max_events)
 {
-  RGWRados *store = ps->store->getRados();
+  // Sining: Motr only support bucket notification. 
+  if (strcmp(ps->store->get_name(), "rados") != 0)
+    return 0;
+
+  RGWRados *store = static_cast<rgw::sal::RadosStore*>(ps->store)->getRados();
   rgw_pubsub_sub_config sub_conf;
   int ret = get_conf(&sub_conf);
   if (ret < 0) {
@@ -928,7 +934,11 @@ int RGWPubSub::SubWithEvents<EventType>::list_events(const DoutPrefixProvider *d
 template<typename EventType>
 int RGWPubSub::SubWithEvents<EventType>::remove_event(const DoutPrefixProvider *dpp, const string& event_id)
 {
-  rgw::sal::RadosStore* store = ps->store;
+  // Sining: Motr only support bucket notification. 
+  if (strcmp(ps->store->get_name(), "rados") != 0)
+    return 0;
+
+  rgw::sal::RadosStore *store = static_cast<rgw::sal::RadosStore*>(ps->store);
   rgw_pubsub_sub_config sub_conf;
   int ret = get_conf(&sub_conf);
   if (ret < 0) {
@@ -964,16 +974,28 @@ int RGWPubSub::SubWithEvents<EventType>::remove_event(const DoutPrefixProvider *
   return 0;
 }
 
-void RGWPubSub::get_meta_obj(rgw_raw_obj *obj) const {
-  *obj = rgw_raw_obj(store->svc()->zone->get_zone_params().log_pool, meta_oid());
+void RGWPubSub::get_meta_obj(rgw_raw_obj *obj) const
+{
+  if (strcmp(store->get_name(), "rados") != 0)
+    return;
+
+  *obj = rgw_raw_obj(static_cast<rgw::sal::RadosStore*>(store)->svc()->zone->get_zone_params().log_pool, get_meta_oid());
 }
 
-void RGWPubSub::get_bucket_meta_obj(const rgw_bucket& bucket, rgw_raw_obj *obj) const {
-  *obj = rgw_raw_obj(store->svc()->zone->get_zone_params().log_pool, bucket_meta_oid(bucket));
+void RGWPubSub::get_bucket_meta_obj(const rgw_bucket& bucket, rgw_raw_obj *obj) const
+{
+  if (strcmp(store->get_name(), "rados") != 0)
+    return;
+
+  *obj = rgw_raw_obj(static_cast<rgw::sal::RadosStore*>(store)->svc()->zone->get_zone_params().log_pool, get_bucket_meta_oid(bucket));
 }
 
-void RGWPubSub::get_sub_meta_obj(const string& name, rgw_raw_obj *obj) const {
-  *obj = rgw_raw_obj(store->svc()->zone->get_zone_params().log_pool, sub_meta_oid(name));
+void RGWPubSub::get_sub_meta_obj(const string& name, rgw_raw_obj *obj) const
+{
+  if (strcmp(store->get_name(), "rados") != 0)
+    return;
+
+  *obj = rgw_raw_obj(static_cast<rgw::sal::RadosStore*>(store)->svc()->zone->get_zone_params().log_pool, get_sub_meta_oid(name));
 }
 
 template<typename EventType>

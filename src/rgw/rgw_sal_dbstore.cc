@@ -1528,6 +1528,27 @@ namespace rgw::sal {
                     ptail_placement_rule, olh_epoch, unique_tag);
   }
 
+  int DBStore::pubsub_read(RGWSysObjectCtx* obj_ctx,
+                             const std::string& oid, bufferlist& bl,
+                             RGWObjVersionTracker *objv_tracker, optional_yield y)
+  {
+    return -ENOTSUP;
+  }
+
+  int DBStore::pubsub_write(const DoutPrefixProvider *dpp, RGWSysObjectCtx* obj_ctx,
+                            const std::string& oid, bufferlist& data,
+                            bool exclusive, RGWObjVersionTracker *objv_tracker,
+                            real_time set_mtime, optional_yield y)
+  {
+    return -ENOTSUP;
+  }
+
+  int DBStore::pubsub_delete(const DoutPrefixProvider *dpp, const std::string& oid,
+                             RGWObjVersionTracker *objv_tracker, optional_yield y)
+  {
+    return -ENOTSUP;
+  }
+
   std::unique_ptr<User> DBStore::get_user(const rgw_user &u)
   {
     return std::make_unique<DBUser>(this, u);

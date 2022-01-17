@@ -539,7 +539,7 @@ void RGWPSCreateNotif_ObjStore_S3::execute(optional_yield y) {
     return;
   }
 
-  ps.emplace(static_cast<rgw::sal::RadosStore*>(store), s->owner.get_id().tenant);
+  ps.emplace(static_cast<rgw::sal::Store*>(store), s->owner.get_id().tenant);
   auto b = ps->get_bucket(bucket_info.bucket);
   ceph_assert(b);
 
@@ -685,7 +685,7 @@ void RGWPSDeleteNotif_ObjStore_S3::execute(optional_yield y) {
     return;
   }
 
-  ps.emplace(static_cast<rgw::sal::RadosStore*>(store), s->owner.get_id().tenant);
+  ps.emplace(static_cast<rgw::sal::Store*>(store), s->owner.get_id().tenant);
   auto b = ps->get_bucket(bucket_info.bucket);
   ceph_assert(b);
 
@@ -760,7 +760,7 @@ public:
 };
 
 void RGWPSListNotifs_ObjStore_S3::execute(optional_yield y) {
-  ps.emplace(static_cast<rgw::sal::RadosStore*>(store), s->owner.get_id().tenant);
+  ps.emplace(static_cast<rgw::sal::Store*>(store), s->owner.get_id().tenant);
   auto b = ps->get_bucket(bucket_info.bucket);
   ceph_assert(b);
   
