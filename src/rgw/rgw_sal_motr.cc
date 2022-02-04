@@ -72,6 +72,10 @@ static map<struct m0_fid, MotrWatcher*, MotrFidComparator> motr_watchers;
 // process_fdmi_record() can't be implemented as MotrWatcher's member function
 // as the function pointer to a member funciton is a different type to fdmi's
 // callback function.
+// A workaround is to make process_fdmi_record() a static function in
+// the rgw::sal namespace. And it works as a dispatcher to further deliver
+// the FDMI event to watcher's callback function. process_fdmi_record()
+// maintains a map between filter fid and watcher.
 static int process_fdmi_record(struct m0_uint128 *rec_id,
                                struct m0_buf fdmi_rec,
                                struct m0_fid filter_id)
@@ -119,7 +123,7 @@ static int process_fdmi_record(struct m0_uint128 *rec_id,
       addr = (char *) cr_rec[i].cr_val.u.ab_buf.b_addr;
       bufferlist bl;
       bl.append(addr, len);
-      rc = watcher->watch_cb(bl);
+      rc = watcher->watch_cb(fp_frag->ffrp_fop_code, bl);
       if (rc < 0)
         goto out;
     }
@@ -135,7 +139,7 @@ int MotrWatcher::init_fdmi_plugin(const DoutPrefixProvider *dpp)
 {
   int rc;
   this->fdmi_dock_ops = m0_fdmi_plugin_dock_api_get();
-  std::cout << "init_fdmi_plugin " << std::endl;
+  ldpp_dout(dpp, 20) << "init_fdmi_plugin " << dendl;
 
   const auto& filter_id = g_conf().get_val<std::string>("motr_cache_fdmi_filter_id");
   rc = m0_fid_sscanf(filter_id.c_str(), &this->fdmi_plugin_fid);
@@ -143,13 +147,13 @@ int MotrWatcher::init_fdmi_plugin(const DoutPrefixProvider *dpp)
     return rc;
   this->fdmi_plugin_cb.po_fdmi_rec = process_fdmi_record;
   const struct m0_fdmi_filter_desc fd;
-  ldpp_dout(dpp, 0) << "register filter " << dendl;
+  ldpp_dout(dpp, 20) << "register filter " << dendl;
   rc = this->fdmi_dock_ops->fpo_register_filter(&this->fdmi_plugin_fid, &fd,
                                                 &this->fdmi_plugin_cb);
   if (rc != 0)
     return rc;
 
-  ldpp_dout(dpp, 0) << "enable filter " << dendl;
+  ldpp_dout(dpp, 20) << "enable filter " << dendl;
   this->fdmi_dock_ops->fpo_enable_filters(true, &this->fdmi_plugin_fid, 1);
   motr_watchers.emplace(this->fdmi_plugin_fid, this);
   return rc;
@@ -167,7 +171,7 @@ int MotrNotifier::init(const DoutPrefixProvider *dpp)
     char i_str[16];
     snprintf(i_str, sizeof(i_str), "%08d", i);
     string iname = "rgw.motr." + this->name + '.' + i_str;
-    ldpp_dout(dpp, 0) << "create watch_notif index = " << iname << dendl;
+    ldpp_dout(dpp, 20) << "create watch_notif index = " << iname << dendl;
     rc = store->create_motr_idx_by_name(iname);
     if (rc < 0 && rc != -EEXIST)
       break;
@@ -187,11 +191,11 @@ int MotrNotifier::notify(const DoutPrefixProvider *dpp, const std::string& key,
 
   bufferlist bl;
   msg.encode(bl);
-  ldpp_dout(dpp, 0) << "send notification:  " << bl.c_str() << dendl;
+  ldpp_dout(dpp, 20) << "send notification:  " << bl.c_str() << dendl;
   return store->do_idx_op_by_name(iname, M0_IC_PUT, key, bl);
 }
 
-int MotrCacheWatcher::watch_cb(bufferlist& bl)
+int MotrCacheWatcher::watch_cb(uint32_t op, bufferlist& bl)
 {
   ldout(this->cctx, 20) << "watch cb: enter " << dendl;
 
@@ -199,7 +203,6 @@ int MotrCacheWatcher::watch_cb(bufferlist& bl)
   auto iter = bl.cbegin();
   cnotif.decode(iter);
   std::string& obj_name = cnotif.get_key();
-  int op = cnotif.get_op();
   ldout(this->cctx, 20) << "watch cb: obj_name = " << obj_name << dendl;
   ldout(this->cctx, 20) << "watch cb: notifier = " << cnotif.get_notifier() << dendl;
   if (this->is_excluded_notifier(cnotif.get_notifier())) {
@@ -208,8 +211,8 @@ int MotrCacheWatcher::watch_cb(bufferlist& bl)
   }
 
   switch (op) {
-  case UPDATE_OBJ:
-  case INVALIDATE_OBJ:
+  case RGW_MOTR_WATCHER_OP_UPDATE:
+  case RGW_MOTR_WATCHER_OP_DEL:
     ldout(this->cctx, 20) << "watch cb: cache invalid " << dendl;
     return 0;
     this->cache->invalid(nullptr, obj_name);
@@ -228,9 +231,22 @@ void MotrMetaCache::invalid(const DoutPrefixProvider *dpp,
 
 int MotrMetaCache::put(const DoutPrefixProvider *dpp,
                        const string& name,
-                       const bufferlist& data)
+                       bufferlist& data, bool data_incl_notif)
 {
-  ldpp_dout(dpp, 0) << "Put into cache: name = " << name << dendl;
+  ldpp_dout(dpp, 20) << "Put into cache: name = " << name << dendl;
+
+  bufferlist val_bl;
+  if (data_incl_notif) {
+    //bufferlist::iterator vit = data.begin();
+    auto vit = data.cbegin();
+    MotrCacheNotif dummy;
+    dummy.decode(vit);
+    //vit += 1;
+    ldpp_dout(dpp, 20) << "off = " << vit.get_off() << ", left = " << vit.get_remaining() << dendl;
+    val_bl.substr_of(data, vit.get_off(), vit.get_remaining());
+    data.clear();
+    data = val_bl;
+  }
 
   ObjectCacheInfo info;
   info.status = 0;
@@ -239,11 +255,6 @@ int MotrMetaCache::put(const DoutPrefixProvider *dpp,
   info.meta.mtime = ceph::real_clock::now();
   info.meta.size = data.length();
   cache.put(dpp, name, info, NULL);
-
-  // Inform other rgw instances. Do nothing if it gets some error?
-  int rc = distribute_cache(dpp, name, info, UPDATE_OBJ);
-  if (rc < 0)
-      ldpp_dout(dpp, 0) << "ERROR: failed to distribute cache for " << name << dendl;
 
   return 0;
 }
@@ -264,10 +275,10 @@ int MotrMetaCache::get(const DoutPrefixProvider *dpp,
     data.clear();
 
     it.copy_all(data);
-    ldpp_dout(dpp, 0) << "Cache hit: name = " << name << dendl;
+    ldpp_dout(dpp, 20) << "Cache hit: name = " << name << dendl;
     return 0;
   }
-  ldpp_dout(dpp, 0) << "Cache miss: name = " << name << ", rc = "<< rc << dendl;
+  ldpp_dout(dpp, 20) << "Cache miss: name = " << name << ", rc = "<< rc << dendl;
   if(rc == -ENODATA)
     return -ENOENT;
 
@@ -279,27 +290,23 @@ int MotrMetaCache::remove(const DoutPrefixProvider *dpp,
 
 {
   cache.invalidate_remove(dpp, name);
-
-  ObjectCacheInfo info;
-  int rc = distribute_cache(dpp, name, info, INVALIDATE_OBJ);
-  if (rc < 0) {
-    ldpp_dout(dpp, 0) << "ERROR: " << __func__ << "(): failed to distribute cache: rc =" << rc << dendl;
-  }
-
-  ldpp_dout(dpp, 0) << "Remove from cache: name = " << name << dendl;
+  ldpp_dout(dpp, 20) << "Remove from cache: name = " << name << dendl;
   return 0;
 }
 
-int MotrMetaCache::distribute_cache(const DoutPrefixProvider *dpp,
-                                    const std::string& name,
-                                    ObjectCacheInfo& obj_info, int op)
+int MotrMetaCache::attach_cache_notif(const DoutPrefixProvider *dpp,
+                                      const std::string& name, int op,
+				      bufferlist& bl)
 {
   if (this->notifier == nullptr)
     return 0;
 
+  // Metadata cache attaches the notification as part of metadata index
+  // value and it doesn't use notifier's indices.
   MotrCacheNotif cnotif(RGW_MOTR_CACHE_FDMI_FILTER_MARKER,
                         this->notifier->get_key(), name, op);
-  return this->notifier->notify(dpp, name, cnotif);
+  cnotif.encode(bl);
+  return 0;
 }
 
 void MotrMetaCache::set_enabled(bool status)
@@ -498,7 +505,7 @@ static int load_user_from_idx(const DoutPrefixProvider *dpp,
         return rc;
 
     // Put into cache.
-    store->get_user_cache()->put(dpp, info.user_id.id, bl);
+    store->get_user_cache()->put(dpp, info.user_id.id, bl, false);
   }
 
   bufferlist& blr = bl;
@@ -585,7 +592,7 @@ int MotrUser::store_user(const DoutPrefixProvider* dpp,
   }
 
   // Put the user info into cache.
-  store->get_user_cache()->put(dpp, info.user_id.id, bl);
+  store->get_user_cache()->put(dpp, info.user_id.id, bl, false);
 
 out:
   return rc;
@@ -629,7 +636,7 @@ int MotrBucket::put_info(const DoutPrefixProvider *dpp, bool exclusive, ceph::re
   int rc = store->do_idx_op_by_name(RGW_MOTR_BUCKET_INST_IDX_NAME,
                                   M0_IC_PUT, info.bucket.name, bl);
   if (rc == 0)
-    store->get_bucket_inst_cache()->put(dpp, info.bucket.name, bl);
+    store->get_bucket_inst_cache()->put(dpp, info.bucket.name, bl, false);
 
   return rc;
 }
@@ -646,7 +653,7 @@ int MotrBucket::load_bucket(const DoutPrefixProvider *dpp, optional_yield y)
     ldpp_dout(dpp, 20) << "load_bucket(): rc=" << rc << dendl;
     if (rc < 0)
       return rc;
-    store->get_bucket_inst_cache()->put(dpp, info.bucket.name, bl);
+    store->get_bucket_inst_cache()->put(dpp, info.bucket.name, bl, false);
   }
 
   struct MotrBucketInfo mbinfo;
@@ -898,8 +905,10 @@ int MotrBucket::list(const DoutPrefixProvider *dpp, ListParams& params, int max,
     if (vals[i].length() == 0) {
       results.common_prefixes[keys[i]] = true;
     } else {
+      MotrCacheNotif dummy;
       rgw_bucket_dir_entry ent;
       auto iter = vals[i].cbegin();
+      dummy.decode(iter);
       ent.decode(iter);
       if (params.list_versions || ent.is_visible())
         results.objs.emplace_back(std::move(ent));
@@ -1054,18 +1063,19 @@ int MotrObject::get_obj_state(const DoutPrefixProvider* dpp, RGWObjectCtx* rctx,
   bufferlist bl;
   if (this->store->get_obj_meta_cache()->get(dpp, this->get_key().to_str(), bl)) {
     // Cache misses.
+    bufferlist val_bl;
     string bucket_index_iname = "motr.rgw.bucket.index." + this->get_bucket()->get_name();
     int rc = this->store->do_idx_op_by_name(bucket_index_iname,
-                                  M0_IC_GET, this->get_key().to_str(), bl);
+                                  M0_IC_GET, this->get_key().to_str(), val_bl);
     if (rc < 0) {
       ldpp_dout(dpp, 0) << "Failed to get object's entry from bucket index. " << dendl;
       return rc;
     }
 
-    // Put into cache.
-    this->store->get_obj_meta_cache()->put(dpp, this->get_key().to_str(), bl);
+    this->store->get_obj_meta_cache()->put(dpp, this->get_key().to_str(), bl, true);
   }
 
+  ldpp_dout(dpp, 20) << "decode bucket dir entry. " << dendl;
   rgw_bucket_dir_entry ent;
   bufferlist& blr = bl;
   auto iter = blr.cbegin();
@@ -1141,7 +1151,7 @@ int MotrObject::get_obj_attrs(RGWObjectCtx* rctx, optional_yield y, const DoutPr
     }
 
     // Put into cache.
-    this->store->get_obj_meta_cache()->put(dpp, key, bl);
+    this->store->get_obj_meta_cache()->put(dpp, key, bl, true);
   }
 
   rgw_bucket_dir_entry ent;
@@ -1803,18 +1813,20 @@ int MotrObject::get_bucket_dir_ent(const DoutPrefixProvider *dpp, rgw_bucket_dir
     }
 
     rc = -ENOENT;
-    for (const auto& bl: vals) {
+    for (auto& bl: vals) {
       if (bl.length() == 0)
         break;
 
       iter = bl.cbegin();
+      MotrCacheNotif dummy;
+      dummy.decode(iter);
       ent_to_check.decode(iter);
       if (ent_to_check.is_current()) {
         ldpp_dout(dpp, 20) << __func__ << ": found current version!" << dendl;
         ent = ent_to_check;
         rc = 0;
 
-        this->store->get_obj_meta_cache()->put(dpp, this->get_name(), bl);
+        this->store->get_obj_meta_cache()->put(dpp, this->get_name(), bl, true);
 
         break;
       }
@@ -1829,7 +1841,7 @@ int MotrObject::get_bucket_dir_ent(const DoutPrefixProvider *dpp, rgw_bucket_dir
                           << rc << dendl;
         return rc;
       }
-      this->store->get_obj_meta_cache()->put(dpp, this->get_key().to_str(), bl);
+      this->store->get_obj_meta_cache()->put(dpp, this->get_key().to_str(), bl, true);
     }
 
     bufferlist& blr = bl;
@@ -1873,8 +1885,10 @@ int MotrObject::update_version_entries(const DoutPrefixProvider *dpp)
     if (bl.length() == 0)
       break;
 
+    MotrCacheNotif dummy;
     rgw_bucket_dir_entry ent;
     auto iter = bl.cbegin();
+    dummy.decode(iter);
     ent.decode(iter);
 
     if (0 != ent.key.name.compare(0, this->get_name().size(), this->get_name()))
@@ -2203,6 +2217,7 @@ int MotrAtomicWriter::complete(size_t accounted_size, const std::string& etag,
 
   if (acc_bl.length() != 0)
     rc = this->write();
+  ldpp_dout(dpp, 20) << "DEBUG: object write rc =" << rc << dendl;
 
   this->cleanup();
 
@@ -2210,7 +2225,8 @@ int MotrAtomicWriter::complete(size_t accounted_size, const std::string& etag,
     return rc;
 
   bufferlist bl;
-  rgw_bucket_dir_entry ent;
+  store->get_obj_meta_cache()->attach_cache_notif(dpp, obj.get_key().to_str(),
+                                                  UPDATE_OBJ, bl);
 
   // Set rgw_bucet_dir_entry. Some of the member of this structure may not
   // apply to motr. For example the storage_class.
@@ -2219,6 +2235,7 @@ int MotrAtomicWriter::complete(size_t accounted_size, const std::string& etag,
   // and RGWRados::Object::Write::write_meta() in rgw_rados.cc for what and
   // how to set the dir entry. Only set the basic ones for POC, no ACLs and
   // other attrs.
+  rgw_bucket_dir_entry ent;
   obj.get_key().get_index_key(&ent.key);
   ent.meta.size = total_data_size;
   ent.meta.accounted_size = total_data_size;
@@ -2276,7 +2293,7 @@ int MotrAtomicWriter::complete(size_t accounted_size, const std::string& etag,
   rc = store->do_idx_op_by_name(bucket_index_iname,
                                 M0_IC_PUT, obj.get_key().to_str(), bl, false);
   if (rc == 0)
-    store->get_obj_meta_cache()->put(dpp, obj.get_key().to_str(), bl);
+    store->get_obj_meta_cache()->put(dpp, obj.get_key().to_str(), bl, true);
 
   return rc;
 }
@@ -2690,6 +2707,8 @@ int MotrMultipartUpload::complete(const DoutPrefixProvider *dpp,
   // Update the dir entry and insert it to the bucket index so
   // the object will be seen when listing the bucket.
   bufferlist update_bl;
+  store->get_obj_meta_cache()->attach_cache_notif(
+	dpp, target_obj->get_name(), UPDATE_OBJ, update_bl);
   target_obj->get_key().get_index_key(&ent.key);  // Change to offical name :)
   ent.meta.size = off;
   ent.meta.accounted_size = accounted_size;
@@ -2711,7 +2730,7 @@ int MotrMultipartUpload::complete(const DoutPrefixProvider *dpp,
     return rc;
 
   // Put into metadata cache.
-  store->get_obj_meta_cache()->put(dpp, target_obj->get_name(), update_bl);
+  store->get_obj_meta_cache()->put(dpp, target_obj->get_name(), update_bl, true);
 
   // Now we can remove it from bucket multipart index.
   ldpp_dout(dpp, 20) << "MotrMultipartUpload::complete(): remove from bucket multipartindex " << dendl;
@@ -3560,7 +3579,7 @@ int MotrStore::init_metadata_cache(const DoutPrefixProvider *dpp,
   this->obj_meta_cache = new MotrMetaCache(dpp, cct);
   this->get_obj_meta_cache()->set_enabled(true);
   //Set watcher & notifier for object metadata cache.
-  this->get_obj_meta_cache()->init_watcher_notifier(dpp, cct, this, 4, "obj.meta.cache.notifier");
+  this->get_obj_meta_cache()->init_watcher_notifier(dpp, cct, this, 0, {});
 
   this->user_cache = new MotrMetaCache(dpp, cct);
   this->get_user_cache()->set_enabled(true);

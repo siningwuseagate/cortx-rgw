@@ -23,6 +23,7 @@ extern "C" {
 #include "fdmi/fdmi.h"
 #include "fdmi/plugin_dock.h"
 #include "fdmi/service.h"
+#include "rpc/rpc_opcodes.h"
 }
 
 #include "rgw_sal.h"
@@ -43,22 +44,54 @@ class MotrStore;
 #define RGW_MOTR_BUCKET_HD_IDX_NAME   "motr.rgw.bucket.headers"
 //#define RGW_MOTR_BUCKET_ACL_IDX_NAME  "motr.rgw.bucket.acls"
 
-// Implement watch-notify using Motr FDMI.
-// (1) A set of global indices, notify_watch_indices
-// (2) For each object to be watched, hash(obj_name) is used to pick which
-//     index in notifiy_watch_indices to insert a new key/value record,
-//     key = unique_fid(obj_name), value = marker (for fdmi filter) + notification msg.
-//     If multiple rgw instances are trying to write the same objects at the same time,
-//     we assume that Motr index is updated atomically.
-// (3) When the index is written, an FDMI record with a special marker is generated and
+// Notes for Motr FDMI:
+// (1) Currently FDMI can only trigger events for index operation, not object
+//     operation.
+// (2) When an index op event is generated, the FDMI filter picks up the events
+//     matching the pre-defined rules. The FDMI event contains the key/value of
+//     the index operation. Currently, fdmi can only do sub string matching on
+//     the value part, not key part, and can't specify which index to watch,
+//     the filter rule is applied to all indices.
+//     this 
+// (3) The FDMI event is delivered to an FDMI application which defines a
+//     callback function to process FDMI events.
+//
+// Implementation of object watch-notify using Motr FDMI. 
+// (1) An FDMI filter is added (in Motr configuration yaml file) specifying
+//     a matching sub-string (marker).
+// (2) A notifier creates a set of indices which are used to trigger FDMI
+//     events and to pass messages.
+// (3) For an object, hash(obj_name) is used to pick which index to insert
+//     a new key/value record,
+//     key = unique_fid(obj_name),
+//     value = marker (for fdmi filter) + notification msg.
+//     If multiple rgw instances are trying to write the same objects at the same
+//     time, we assume that Motr index is updated atomically.
+// (4) An FDMI event with a special marker is generated and
 //     picked up by the filter and delivered to our fdmi application, watcher.
-// (4) The embedded notification message is then processed to get object name and index
-//     opcode. These info are sent to cache layer.
-// (5) Update cache item accordingly and release notification(fdmi record).
+//     The watcher defines the callback function processing the FDMI events.
+// (5) The embedded notification message is then decoded to get object name
+//     and index opcode for further action.
+//
+// How metadata cache use watch-notify:
+// (1) MGW uses an index to store object metatadata.
+// (2) As metadata has its own index, instead of creating a set of new
+//     notification indices above, metadata cache makes use of the metadata
+//     index to pass notification.
+//     When an object's metadata is updated, the corresponding key/value pair
+//     in the metadata index is updated. The value is attached with a
+//     notification message containing the FDMI filter's matching sub-string.
+// (3) When the watcher receives notification, the decoded info are sent to
+//     cache layer.
+// (4) Update cache item accordingly and release notification(fdmi record).
+// (5) Note: if the size of metadata is big, the FDMI event size created will
+//     be big too (key + notification + metadata), the overhead to transfer
+//     the FDMI event is big, how will this impact the performance and
+//     scalability of FDMI?
 
 #define RGW_MOTR_CACHE_FDMI_FILTER_MARKER "rgw.motr.cache.fdmi.marker"
 
-// Notification message.
+// The notification message sent from notifier to watcher.
 class MotrWatchNotifyMsg {
 protected:
   // The marker is used by FDMI to filter out the notification.
@@ -103,6 +136,8 @@ public:
 };
 WRITE_CLASS_ENCODER(MotrWatchNotifyMsg)
 
+// The notification sent by cache to inform changes on
+// an object's metadata.
 class MotrCacheNotif : public MotrWatchNotifyMsg {
 protected:
   // Key of the cache item.
@@ -147,6 +182,10 @@ WRITE_CLASS_ENCODER(MotrCacheNotif)
 // MotrWatcher registers a FDMI filter and a FDMI callback function.
 // When FDMI records (picked up by the filter) arrive, the callback function
 // process the records and retrieve the information sent by the notifier.
+enum {
+	RGW_MOTR_WATCHER_OP_UPDATE = M0_CAS_PUT_FOP_OPCODE,
+	RGW_MOTR_WATCHER_OP_DEL = M0_CAS_DEL_FOP_OPCODE
+};
 class MotrWatcher {
 protected:
   CephContext *cctx{nullptr};
@@ -166,7 +205,7 @@ public:
   // Callback function of the watcher's user. For example, if watcher is
   // user by object metadata cache, this callback function is called to
   // trigger corresponding cache actions.
-  virtual int watch_cb(bufferlist& bl) = 0;
+  virtual int watch_cb(uint32_t op, bufferlist& bl) = 0;
   int init_fdmi_plugin(const DoutPrefixProvider *dpp);
 
   void exclude_notifier(std::string notifier) {
@@ -186,7 +225,7 @@ protected:
 
 public:
   MotrCacheWatcher(CephContext *_cctx, MotrMetaCache* _cache) : MotrWatcher(_cctx), cache(_cache){}
-  virtual int watch_cb(bufferlist& bl) override;
+  virtual int watch_cb(uint32_t op, bufferlist& bl) override;
 };
 
 class MotrStore;
@@ -250,7 +289,8 @@ public:
   int get(const DoutPrefixProvider *dpp, const std::string& name, bufferlist& data);
 
   // Insert a cache entry.
-  int put(const DoutPrefixProvider *dpp, const std::string& name, const bufferlist& data);
+  int put(const DoutPrefixProvider *dpp, const std::string& name,
+          bufferlist& data, bool data_incl_notif);
 
   // Called when an object is deleted. Notification should be sent to other
   // RGW instances.
@@ -261,12 +301,18 @@ public:
 
   void set_enabled(bool status);
 
-  // distribute_cache() is to notify any update on the cached metadata.
-  // The notification is monitored by watchers of other RGW instance. Once
-  // receiving the notifcation, the callback function of the watcher is invoked.
-  int distribute_cache(const DoutPrefixProvider *dpp,
-                       const std::string& name,
-                       ObjectCacheInfo& obj_info, int op);
+  // As explained above, metadata cache doesn't use dedicated
+  // indices to pass notification. Instead, it makes use of the
+  // metada index. For example, bucket index for object metadata.
+  // attach_cache_notifi() is to attach a notification a key/value pair
+  // when an object's metadata is changed. The notification contains
+  // fdmi filter string which will trigger a fdmi event. The fdmi event
+  // will be monitored by watchers of other RGW instance. Once receiving
+  // fdmi event, the callback function of the watcher is invoked to retrieve
+  // the notification and to take action on cache item accordingly.
+  int attach_cache_notif(const DoutPrefixProvider *dpp,
+                         const std::string& name, int op,
+		         bufferlist& bl);
 
   int init_watcher_notifier(const DoutPrefixProvider *dpp, CephContext *cctx,
                             MotrStore *store, int nr_indices, const std::string notifier_name)
