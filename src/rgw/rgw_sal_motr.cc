@@ -1331,7 +1331,8 @@ check_keycount:
           if (!null_ent.key.empty() &&
               (null_ent.key.name != ent.key.name ||
                null_ent.meta.mtime > ent.meta.mtime)) {
-            if (ent.key.instance == params.marker.instance)
+            if (params.marker.instance != "" &&
+                ent.key.instance == params.marker.instance)
               null_ent.key = {}; // filtered out by the marker
             else {
               results.objs.emplace_back(std::move(null_ent));
@@ -3699,6 +3700,7 @@ int MotrMultipartUpload::delete_parts(const DoutPrefixProvider *dpp, std::string
   int marker = 0;
   bool truncated = false;
 
+  this->set_version_id(version_id);
   // Scan all parts and delete the corresponding motr objects.
   do {
     rc = this->list_parts(dpp, store->ctx(), max_parts, marker, &marker, &truncated);
@@ -3954,8 +3956,9 @@ int MotrMultipartUpload::list_parts(const DoutPrefixProvider *dpp, CephContext *
     std::string key_name;
 
     // Get the object entry
+    mobj_ver->set_instance(this->get_version_id());
     int ret_rc = mobj_ver->get_bucket_dir_ent(dpp, ent);
-    if(ret_rc < 0)
+    if (ret_rc < 0)
       return ret_rc;
 
     if (!ent.is_delete_marker()) {
