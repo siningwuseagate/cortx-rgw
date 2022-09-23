@@ -1,13 +1,16 @@
 import errno
+import ipaddress
 import logging
 import os
+import socket
 from typing import List, Any, Tuple, Dict, Optional, cast
 from urllib.parse import urlparse
 
 from mgr_module import HandleCommandResult
 
 from orchestrator import DaemonDescription
-from ceph.deployment.service_spec import AlertManagerSpec, GrafanaSpec, ServiceSpec, SNMPGatewaySpec
+from ceph.deployment.service_spec import AlertManagerSpec, GrafanaSpec, ServiceSpec, \
+    SNMPGatewaySpec, PrometheusSpec
 from cephadm.services.cephadmservice import CephadmService, CephadmDaemonDeploySpec
 from cephadm.services.ingress import IngressSpec
 from mgr_util import verify_tls, ServerConfigException, create_self_signed_cert, build_url
@@ -37,19 +40,23 @@ class GrafanaService(CephadmService):
 
             deps.append(dd.name())
 
-        daemons = self.mgr.cache.get_daemons_by_service('mgr')
+        daemons = self.mgr.cache.get_daemons_by_service('loki')
         loki_host = ''
-        assert daemons is not None
-        if daemons != []:
-            assert daemons[0].hostname is not None
-            addr = daemons[0].ip if daemons[0].ip else self._inventory_get_fqdn(daemons[0].hostname)
-            loki_host = build_url(scheme='http', host=addr, port=3100)
+        for i, dd in enumerate(daemons):
+            assert dd.hostname is not None
+            if i == 0:
+                addr = dd.ip if dd.ip else self._inventory_get_fqdn(dd.hostname)
+                loki_host = build_url(scheme='http', host=addr, port=3100)
+
+            deps.append(dd.name())
 
         grafana_data_sources = self.mgr.template.render(
             'services/grafana/ceph-dashboard.yml.j2', {'hosts': prom_services, 'loki_host': loki_host})
 
-        cert = self.mgr.get_store('grafana_crt')
-        pkey = self.mgr.get_store('grafana_key')
+        cert_path = f'{daemon_spec.host}/grafana_crt'
+        key_path = f'{daemon_spec.host}/grafana_key'
+        cert = self.mgr.get_store(cert_path)
+        pkey = self.mgr.get_store(key_path)
         if cert and pkey:
             try:
                 verify_tls(cert, pkey)
@@ -57,9 +64,9 @@ class GrafanaService(CephadmService):
                 logger.warning('Provided grafana TLS certificates invalid: %s', str(e))
                 cert, pkey = None, None
         if not (cert and pkey):
-            cert, pkey = create_self_signed_cert('Ceph', 'cephadm')
-            self.mgr.set_store('grafana_crt', cert)
-            self.mgr.set_store('grafana_key', pkey)
+            cert, pkey = create_self_signed_cert('Ceph', daemon_spec.host)
+            self.mgr.set_store(cert_path, cert)
+            self.mgr.set_store(key_path, pkey)
             if 'dashboard' in self.mgr.get('mgr_map')['modules']:
                 self.mgr.check_mon_command({
                     'prefix': 'dashboard set-grafana-api-ssl-verify',
@@ -74,6 +81,10 @@ class GrafanaService(CephadmService):
                 'http_port': daemon_spec.ports[0] if daemon_spec.ports else self.DEFAULT_SERVICE_PORT,
                 'http_addr': daemon_spec.ip if daemon_spec.ip else ''
             })
+
+        if 'dashboard' in self.mgr.get('mgr_map')['modules'] and spec.initial_admin_password:
+            self.mgr.check_mon_command(
+                {'prefix': 'dashboard set-grafana-api-password'}, inbuf=spec.initial_admin_password)
 
         config_file = {
             'files': {
@@ -105,6 +116,17 @@ class GrafanaService(CephadmService):
             'dashboard set-grafana-api-url',
             service_url
         )
+
+    def pre_remove(self, daemon: DaemonDescription) -> None:
+        """
+        Called before grafana daemon is removed.
+        """
+        if daemon.hostname is not None:
+            # delete cert/key entires for this grafana daemon
+            cert_path = f'{daemon.hostname}/grafana_crt'
+            key_path = f'{daemon.hostname}/grafana_key'
+            self.mgr.set_store(cert_path, None)
+            self.mgr.set_store(key_path, None)
 
     def ok_to_stop(self,
                    daemon_ids: List[str],
@@ -148,8 +170,19 @@ class AlertmanagerService(CephadmService):
         proto = None  # http: or https:
         url = mgr_map.get('services', {}).get('dashboard', None)
         if url:
-            dashboard_urls.append(url.rstrip('/'))
-            p_result = urlparse(url)
+            p_result = urlparse(url.rstrip('/'))
+            hostname = socket.getfqdn(p_result.hostname)
+
+            try:
+                ip = ipaddress.ip_address(hostname)
+            except ValueError:
+                pass
+            else:
+                if ip.version == 6:
+                    hostname = f'[{hostname}]'
+
+            dashboard_urls.append(
+                f'{p_result.scheme}://{hostname}:{p_result.port}{p_result.path}')
             proto = p_result.scheme
             port = p_result.port
         # scan all mgrs to generate deps and to get standbys too.
@@ -257,6 +290,20 @@ class PrometheusService(CephadmService):
             daemon_spec: CephadmDaemonDeploySpec,
     ) -> Tuple[Dict[str, Any], List[str]]:
         assert self.TYPE == daemon_spec.daemon_type
+
+        prom_spec = cast(PrometheusSpec, self.mgr.spec_store[daemon_spec.service_name].spec)
+
+        try:
+            retention_time = prom_spec.retention_time if prom_spec.retention_time else '15d'
+        except AttributeError:
+            retention_time = '15d'
+
+        try:
+            retention_size = prom_spec.retention_size if prom_spec.retention_size else '0'
+        except AttributeError:
+            # default to disabled
+            retention_size = '0'
+
         deps = []  # type: List[str]
 
         # scrape mgrs
@@ -331,12 +378,14 @@ class PrometheusService(CephadmService):
             'haproxy_targets': haproxy_targets,
             'nodes': nodes,
         }
-        r = {
+        r: Dict[str, Any] = {
             'files': {
                 'prometheus.yml':
                     self.mgr.template.render(
                         'services/prometheus/prometheus.yml.j2', context)
-            }
+            },
+            'retention_time': retention_time,
+            'retention_size': retention_size
         }
 
         # include alerts, if present in the container
@@ -344,6 +393,23 @@ class PrometheusService(CephadmService):
             with open(self.mgr.prometheus_alerts_path, 'r', encoding='utf-8') as f:
                 alerts = f.read()
             r['files']['/etc/prometheus/alerting/ceph_alerts.yml'] = alerts
+
+        # Include custom alerts if present in key value store. This enables the
+        # users to add custom alerts. Write the file in any case, so that if the
+        # content of the key value store changed, that file is overwritten
+        # (emptied in case they value has been removed from the key value
+        # store). This prevents the necessity to adapt `cephadm` binary to
+        # remove the file.
+        #
+        # Don't use the template engine for it as
+        #
+        #   1. the alerts are always static and
+        #   2. they are a template themselves for the Go template engine, which
+        #      use curly braces and escaping that is cumbersome and unnecessary
+        #      for the user.
+        #
+        r['files']['/etc/prometheus/alerting/custom_alerts.yml'] = \
+            self.mgr.get_store('services/prometheus/alerting/custom_alerts.yml', '')
 
         return r, sorted(deps)
 
@@ -432,14 +498,18 @@ class PromtailService(CephadmService):
     def generate_config(self, daemon_spec: CephadmDaemonDeploySpec) -> Tuple[Dict[str, Any], List[str]]:
         assert self.TYPE == daemon_spec.daemon_type
         deps: List[str] = []
-        hostnames: List[str] = []
-        for dd in self.mgr.cache.get_daemons_by_service('mgr'):
+
+        daemons = self.mgr.cache.get_daemons_by_service('loki')
+        loki_host = ''
+        for i, dd in enumerate(daemons):
             assert dd.hostname is not None
-            addr = self.mgr.inventory.get_addr(dd.hostname)
-            hostnames.append(addr)
+            if i == 0:
+                loki_host = dd.ip if dd.ip else self._inventory_get_fqdn(dd.hostname)
+
+            deps.append(dd.name())
+
         context = {
-            'hostnames': hostnames,
-            'client_hostname': hostnames[0],
+            'client_hostname': loki_host,
         }
 
         yml = self.mgr.template.render('services/promtail.yml.j2', context)

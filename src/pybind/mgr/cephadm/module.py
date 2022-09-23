@@ -25,7 +25,8 @@ from ceph.deployment import inventory
 from ceph.deployment.drive_group import DriveGroupSpec
 from ceph.deployment.service_spec import \
     ServiceSpec, PlacementSpec, \
-    HostPlacementSpec, IngressSpec
+    HostPlacementSpec, IngressSpec, \
+    TunedProfileSpec, IscsiServiceSpec, PrometheusSpec
 from ceph.utils import str_to_datetime, datetime_to_str, datetime_now
 from cephadm.serve import CephadmServe
 from cephadm.services.cephadmservice import CephadmDaemonDeploySpec
@@ -56,13 +57,14 @@ from .services.monitoring import GrafanaService, AlertmanagerService, Prometheus
     NodeExporterService, SNMPGatewayService, LokiService, PromtailService
 from .schedule import HostAssignment
 from .inventory import Inventory, SpecStore, HostCache, AgentCache, EventStore, \
-    ClientKeyringStore, ClientKeyringSpec
+    ClientKeyringStore, ClientKeyringSpec, TunedProfileStore
 from .upgrade import CephadmUpgrade
 from .template import TemplateMgr
 from .utils import CEPH_IMAGE_TYPES, RESCHEDULE_FROM_OFFLINE_HOSTS_TYPES, forall_hosts, \
     cephadmNoImage, CEPH_UPGRADE_ORDER
 from .configchecks import CephadmConfigChecks
 from .offline_watcher import OfflineHostWatcher
+from .tuned_profiles import TunedProfileUtils
 
 try:
     import asyncssh
@@ -393,6 +395,12 @@ class CephadmOrchestrator(orchestrator.Orchestrator, MgrModule,
             default=10,
             desc='max number of osds that will be drained simultaneously when osds are removed'
         ),
+        Option(
+            'cgroups_split',
+            type='bool',
+            default=True,
+            desc='Pass --cgroups=split when cephadm creates containers (currently podman only)'
+        ),
     ]
 
     def __init__(self, *args: Any, **kwargs: Any):
@@ -463,6 +471,7 @@ class CephadmOrchestrator(orchestrator.Orchestrator, MgrModule,
             self.apply_spec_fails: List[Tuple[str, str]] = []
             self.max_osd_draining_count = 10
             self.device_enhanced_scan = False
+            self.cgroups_split = True
 
         self.notify(NotifyType.mon_map, None)
         self.config_notify()
@@ -505,6 +514,11 @@ class CephadmOrchestrator(orchestrator.Orchestrator, MgrModule,
         self.keys = ClientKeyringStore(self)
         self.keys.load()
 
+        self.tuned_profiles = TunedProfileStore(self)
+        self.tuned_profiles.load()
+
+        self.tuned_profile_utils = TunedProfileUtils(self)
+
         # ensure the host lists are in sync
         for h in self.inventory.keys():
             if h not in self.cache.daemons:
@@ -533,6 +547,7 @@ class CephadmOrchestrator(orchestrator.Orchestrator, MgrModule,
 
         self.mgr_service: MgrService = cast(MgrService, self.cephadm_services['mgr'])
         self.osd_service: OSDService = cast(OSDService, self.cephadm_services['osd'])
+        self.iscsi_service: IscsiService = cast(IscsiService, self.cephadm_services['iscsi'])
 
         self.template = TemplateMgr(self)
 
@@ -1756,6 +1771,34 @@ Then run the following:
 
         return f"Ceph cluster {self._cluster_fsid} on {hostname} has exited maintenance mode"
 
+    @handle_orch_error
+    @host_exists()
+    def rescan_host(self, hostname: str) -> str:
+        """Use cephadm to issue a disk rescan on each HBA
+
+        Some HBAs and external enclosures don't automatically register
+        device insertion with the kernel, so for these scenarios we need
+        to manually rescan
+
+        :param hostname: (str) host name
+        """
+        self.log.info(f'disk rescan request sent to host "{hostname}"')
+        _out, _err, _code = self.wait_async(CephadmServe(self)._run_cephadm(hostname, cephadmNoImage, "disk-rescan",
+                                                                            [],
+                                                                            no_fsid=True,
+                                                                            error_ok=True))
+        if not _err:
+            raise OrchestratorError('Unexpected response from cephadm disk-rescan call')
+
+        msg = _err[0].split('\n')[-1]
+        log_msg = f'disk rescan: {msg}'
+        if msg.upper().startswith('OK'):
+            self.log.info(log_msg)
+        else:
+            self.log.warning(log_msg)
+
+        return f'{msg}'
+
     def get_minimal_ceph_conf(self) -> str:
         _, config, _ = self.check_mon_command({
             "prefix": "config generate-minimal-conf",
@@ -1890,6 +1933,9 @@ Then run the following:
 
     @handle_orch_error
     def service_action(self, action: str, service_name: str) -> List[str]:
+        if service_name not in self.spec_store.all_specs.keys():
+            raise OrchestratorError(f'Invalid service name "{service_name}".'
+                                    + ' View currently running services using "ceph orch ls"')
         dds: List[DaemonDescription] = self.cache.get_daemons_by_service(service_name)
         if not dds:
             raise OrchestratorError(f'No daemons exist under service name "{service_name}".'
@@ -1918,6 +1964,11 @@ Then run the following:
             if daemon_spec.daemon_type != 'osd':
                 daemon_spec = self.cephadm_services[daemon_type_to_service(
                     daemon_spec.daemon_type)].prepare_create(daemon_spec)
+            else:
+                # for OSDs, we still need to update config, just not carry out the full
+                # prepare_create function
+                daemon_spec.final_config, daemon_spec.deps = self.osd_service.generate_config(
+                    daemon_spec)
             return self.wait_async(CephadmServe(self)._create_daemon(daemon_spec, reconfig=(action == 'reconfig')))
 
         actions = {
@@ -2318,12 +2369,17 @@ Then run the following:
             deps = sorted([self.get_mgr_ip(), server_port, root_cert,
                            str(self.device_enhanced_scan)])
         elif daemon_type == 'iscsi':
-            deps = [self.get_mgr_ip()]
+            if spec:
+                iscsi_spec = cast(IscsiServiceSpec, spec)
+                deps = [self.iscsi_service.get_trusted_ips(iscsi_spec)]
+            else:
+                deps = [self.get_mgr_ip()]
         else:
             need = {
                 'prometheus': ['mgr', 'alertmanager', 'node-exporter', 'ingress'],
-                'grafana': ['prometheus'],
+                'grafana': ['prometheus', 'loki'],
                 'alertmanager': ['mgr', 'alertmanager', 'snmp-gateway'],
+                'promtail': ['loki'],
             }
             for dep_type in need.get(daemon_type, []):
                 for dd in self.cache.get_daemons_by_type(dep_type):
@@ -2433,7 +2489,120 @@ Then run the following:
             # should only refresh if a change has been detected
             self._trigger_preview_refresh(specs=[cast(DriveGroupSpec, spec)])
 
+        if spec.service_type == 'prometheus':
+            spec = cast(PrometheusSpec, spec)
+            if spec.retention_time:
+                valid_units = ['y', 'w', 'd', 'h', 'm', 's']
+                m = re.search(rf"^(\d+)({'|'.join(valid_units)})$", spec.retention_time)
+                if not m:
+                    raise OrchestratorError(f"Invalid retention time. Valid units are: {', '.join(valid_units)}")
+            if spec.retention_size:
+                valid_units = ['B', 'KB', 'MB', 'GB', 'TB', 'PB', 'EB']
+                m = re.search(rf"^(\d+)({'|'.join(valid_units)})$", spec.retention_size)
+                if not m:
+                    raise OrchestratorError(f"Invalid retention size. Valid units are: {', '.join(valid_units)}")
+
         return self._apply_service_spec(cast(ServiceSpec, spec))
+
+    def _get_candidate_hosts(self, placement: PlacementSpec) -> List[str]:
+        """Return a list of candidate hosts according to the placement specification."""
+        all_hosts = self.cache.get_schedulable_hosts()
+        draining_hosts = [dh.hostname for dh in self.cache.get_draining_hosts()]
+        candidates = []
+        if placement.hosts:
+            candidates = [h.hostname for h in placement.hosts if h.hostname in placement.hosts]
+        elif placement.label:
+            candidates = [x.hostname for x in [h for h in all_hosts if placement.label in h.labels]]
+        elif placement.host_pattern:
+            candidates = [x for x in placement.filter_matching_hostspecs(all_hosts)]
+        elif (placement.count is not None or placement.count_per_host is not None):
+            candidates = [x.hostname for x in all_hosts]
+        return [h for h in candidates if h not in draining_hosts]
+
+    def _validate_one_shot_placement_spec(self, spec: PlacementSpec) -> None:
+        """Validate placement specification for TunedProfileSpec and ClientKeyringSpec."""
+        if spec.count is not None:
+            raise OrchestratorError(
+                "Placement 'count' field is no supported for this specification.")
+        if spec.count_per_host is not None:
+            raise OrchestratorError(
+                "Placement 'count_per_host' field is no supported for this specification.")
+        if spec.hosts:
+            all_hosts = [h.hostname for h in self.inventory.all_specs()]
+            invalid_hosts = [h.hostname for h in spec.hosts if h.hostname not in all_hosts]
+            if invalid_hosts:
+                raise OrchestratorError(f"Found invalid host(s) in placement section: {invalid_hosts}. "
+                                        f"Please check 'ceph orch host ls' for available hosts.")
+        elif not self._get_candidate_hosts(spec):
+            raise OrchestratorError("Invalid placement specification. No host(s) matched placement spec.\n"
+                                    "Please check 'ceph orch host ls' for available hosts.\n"
+                                    "Note: draining hosts are excluded from the candidate list.")
+
+    def _validate_tunedprofile_settings(self, spec: TunedProfileSpec) -> Dict[str, List[str]]:
+        candidate_hosts = spec.placement.filter_matching_hostspecs(self.inventory.all_specs())
+        invalid_options: Dict[str, List[str]] = {}
+        for host in candidate_hosts:
+            host_sysctl_options = self.cache.get_facts(host).get('sysctl_options', {})
+            invalid_options[host] = []
+            for option in spec.settings:
+                if option not in host_sysctl_options:
+                    invalid_options[host].append(option)
+        return invalid_options
+
+    def _validate_tuned_profile_spec(self, spec: TunedProfileSpec) -> None:
+        if not spec.settings:
+            raise OrchestratorError("Invalid spec: settings section cannot be empty.")
+        self._validate_one_shot_placement_spec(spec.placement)
+        invalid_options = self._validate_tunedprofile_settings(spec)
+        if any(e for e in invalid_options.values()):
+            raise OrchestratorError(
+                f'Failed to apply tuned profile. Invalid sysctl option(s) for host(s) detected: {invalid_options}')
+
+    @handle_orch_error
+    def apply_tuned_profiles(self, specs: List[TunedProfileSpec], no_overwrite: bool = False) -> str:
+        outs = []
+        for spec in specs:
+            self._validate_tuned_profile_spec(spec)
+            if no_overwrite and self.tuned_profiles.exists(spec.profile_name):
+                outs.append(
+                    f"Tuned profile '{spec.profile_name}' already exists (--no-overwrite was passed)")
+            else:
+                # done, let's save the specs
+                self.tuned_profiles.add_profile(spec)
+                outs.append(f'Saved tuned profile {spec.profile_name}')
+        self._kick_serve_loop()
+        return '\n'.join(outs)
+
+    @handle_orch_error
+    def rm_tuned_profile(self, profile_name: str) -> str:
+        if profile_name not in self.tuned_profiles:
+            raise OrchestratorError(
+                f'Tuned profile {profile_name} does not exist. Nothing to remove.')
+        self.tuned_profiles.rm_profile(profile_name)
+        self._kick_serve_loop()
+        return f'Removed tuned profile {profile_name}'
+
+    @handle_orch_error
+    def tuned_profile_ls(self) -> List[TunedProfileSpec]:
+        return self.tuned_profiles.list_profiles()
+
+    @handle_orch_error
+    def tuned_profile_add_setting(self, profile_name: str, setting: str, value: str) -> str:
+        if profile_name not in self.tuned_profiles:
+            raise OrchestratorError(
+                f'Tuned profile {profile_name} does not exist. Cannot add setting.')
+        self.tuned_profiles.add_setting(profile_name, setting, value)
+        self._kick_serve_loop()
+        return f'Added setting {setting} with value {value} to tuned profile {profile_name}'
+
+    @handle_orch_error
+    def tuned_profile_rm_setting(self, profile_name: str, setting: str) -> str:
+        if profile_name not in self.tuned_profiles:
+            raise OrchestratorError(
+                f'Tuned profile {profile_name} does not exist. Cannot remove setting.')
+        self.tuned_profiles.rm_setting(profile_name, setting)
+        self._kick_serve_loop()
+        return f'Removed setting {setting} from tuned profile {profile_name}'
 
     def set_health_warning(self, name: str, summary: str, count: int, detail: List[str]) -> None:
         self.health_checks[name] = {
@@ -2460,6 +2629,7 @@ Then run the following:
             spec=spec,
             hosts=self.cache.get_schedulable_hosts(),
             unreachable_hosts=self.cache.get_unreachable_hosts(),
+            draining_hosts=self.cache.get_draining_hosts(),
             networks=self.cache.networks,
             daemons=self.cache.get_daemons_by_service(spec.service_name()),
             allow_colo=svc.allow_colo(),
@@ -2538,6 +2708,7 @@ Then run the following:
             spec=spec,
             hosts=self.inventory.all_specs(),  # All hosts, even those without daemon refresh
             unreachable_hosts=self.cache.get_unreachable_hosts(),
+            draining_hosts=self.cache.get_draining_hosts(),
             networks=self.cache.networks,
             daemons=self.cache.get_daemons_by_service(spec.service_name()),
             allow_colo=self.cephadm_services[spec.service_type].allow_colo(),
@@ -2770,7 +2941,10 @@ Then run the following:
 
         # trigger the serve loop to initiate the removal
         self._kick_serve_loop()
-        return "Scheduled OSD(s) for removal"
+        warning_zap = "" if zap else ("\nVG/LV for the OSDs won't be zapped (--zap wasn't passed).\n"
+                                      "Run the `ceph-volume lvm zap` command with `--destroy`"
+                                      " against the VG/LV if you want them to be destroyed.")
+        return f"Scheduled OSD(s) for removal.{warning_zap}"
 
     @handle_orch_error
     def stop_remove_osds(self, osd_ids: List[str]) -> str:
