@@ -1054,17 +1054,14 @@ void RGWGetObjTags::execute(optional_yield y)
   s->object->set_atomic(s->obj_ctx);
 
   op_ret = s->object->get_obj_attrs(s->obj_ctx, y, this);
-  if (op_ret < 0) {
-    ldpp_dout(this, 0) << "ERROR: failed to get obj attrs, obj=" << s->object
-        << " ret=" << op_ret << dendl;
-    return;
-  }
 
-  attrs = s->object->get_attrs();
-  auto tags = attrs.find(RGW_ATTR_TAGS);
-  if(tags != attrs.end()){
-    has_tags = true;
-    tags_bl.append(tags->second);
+  if (op_ret == 0) {
+    attrs = s->object->get_attrs();
+    auto tags = attrs.find(RGW_ATTR_TAGS);
+    if (tags != attrs.end()) {
+      has_tags = true;
+      tags_bl.append(tags->second);
+    }
   }
   send_response_data(tags_bl);
 }
@@ -3453,6 +3450,12 @@ void RGWDeleteBucket::execute(optional_yield y)
 int RGWPutObj::init_processing(optional_yield y) {
   copy_source = url_decode(s->info.env->get("HTTP_X_AMZ_COPY_SOURCE", ""));
   copy_source_range = s->info.env->get("HTTP_X_AMZ_COPY_SOURCE_RANGE");
+  // Upload Part copy operation is not supported yet in MGW
+  if(copy_source_range) {
+      ldpp_dout(this, 0) << "ERROR: Upload Part copy (range copy) has not been implemented." << dendl;
+      s->err.message = "Unsupported Action Requested.";
+      return - ERR_NOT_IMPLEMENTED;
+  }
   size_t pos;
   int ret;
 

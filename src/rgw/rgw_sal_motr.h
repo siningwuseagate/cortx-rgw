@@ -32,6 +32,11 @@ extern "C" {
 #include "rgw_role.h"
 #include "rgw_multi.h"
 #include "rgw_putobj_processor.h"
+#include "motr/gc/gc.h"
+#include <sstream>
+typedef void (*progress_cb)(off_t, void*);
+
+class MotrGC;
 
 namespace rgw::sal {
 
@@ -43,6 +48,13 @@ class MotrStore;
 #define RGW_MOTR_BUCKET_HD_IDX_NAME   "motr.rgw.bucket.headers"
 #define RGW_IAM_MOTR_ACCESS_KEY       "motr.rgw.accesskeys"
 #define RGW_IAM_MOTR_EMAIL_KEY        "motr.rgw.emails"
+
+// log level mapping for RGW SAL
+#define LOG_CRITICAL 0
+#define LOG_ERROR 0
+#define LOG_WARNING 5
+#define LOG_INFO 10
+#define LOG_DEBUG 20
 
 //#define RGW_MOTR_BUCKET_ACL_IDX_NAME  "motr.rgw.bucket.acls"
 
@@ -503,10 +515,23 @@ struct AccumulateIOCtxt{
 };
 
 class MotrCopyObj_Filter : public RGWGetDataCB {
+private:
+  progress_cb _progress_cb;
+  void *progress_data;
 public:
   virtual int handle_data(bufferlist& bl, off_t bl_ofs, off_t bl_len) override { return 0; }
   MotrCopyObj_Filter() {}
   virtual ~MotrCopyObj_Filter() override {}
+  void set_progress_callback(progress_cb progressCB, void *progressData){
+    this->_progress_cb = progressCB;
+    this->progress_data = progressData;
+  }
+  progress_cb get_progress_cb(){
+    return this->_progress_cb;
+  }
+  void *get_progress_data(){
+    return this->progress_data;
+  }
 };
 
 class MotrCopyObj_CB : public MotrCopyObj_Filter
@@ -514,13 +539,15 @@ class MotrCopyObj_CB : public MotrCopyObj_Filter
   const DoutPrefixProvider* m_dpp;
   std::shared_ptr<rgw::sal::Writer> m_dst_writer;
   off_t write_offset;
-
+  struct req_state *s;
 public:
   explicit MotrCopyObj_CB(const DoutPrefixProvider* dpp, 
-                         std::shared_ptr<rgw::sal::Writer> dst_writer) : 
+                         std::shared_ptr<rgw::sal::Writer> dst_writer, RGWObjectCtx& obj_ctx) :
                          m_dpp(dpp),
                          m_dst_writer(dst_writer),
-                         write_offset(0) {}
+                         write_offset(0) {
+                          s = static_cast<req_state*>(obj_ctx.get_private());
+                         }
   virtual ~MotrCopyObj_CB() override {}
   int handle_data(bufferlist& bl, off_t bl_ofs, off_t bl_len) override;
 };
@@ -543,6 +570,7 @@ class MotrObject : public Object {
     uint64_t part_num;
     // Object size as available from Content-Length header
     uint64_t expected_obj_size = 0;
+    int64_t  chunk_io_sz = 0;
     // Total Number of bytes processed so far
     uint64_t processed_bytes = 0;
     struct AccumulateIOCtxt io_ctxt = {};
@@ -554,6 +582,13 @@ class MotrObject : public Object {
       struct m0_uint128 oid = {};
       struct m0_fid pver = {};
       uint64_t layout_id = 0;
+
+      std::string oid_str() {
+        std::ostringstream oid_stream;
+        oid_stream << "0x" << std::hex << oid.u_hi
+                   << ":0x" << oid.u_lo;
+        return oid_stream.str();
+      }
 
       void encode(bufferlist& bl) const
       {
@@ -668,7 +703,6 @@ class MotrObject : public Object {
     virtual int set_obj_attrs(const DoutPrefixProvider* dpp, RGWObjectCtx* rctx, Attrs* setattrs, Attrs* delattrs, optional_yield y, rgw_obj* target_obj = NULL) override;
     virtual int get_obj_attrs(RGWObjectCtx* rctx, optional_yield y, const DoutPrefixProvider* dpp, rgw_obj* target_obj = NULL) override;
     int fetch_obj_entry_and_key(const DoutPrefixProvider* dpp, rgw_bucket_dir_entry& ent, std::string& bname, std::string& key, rgw_obj* target_obj);
-    void read_bucket_info(const DoutPrefixProvider* dpp, std::string& bname, std::string& key, rgw_obj* target_obj = NULL);
     virtual int modify_obj_attrs(RGWObjectCtx* rctx, const char* attr_name, bufferlist& attr_val, optional_yield y, const DoutPrefixProvider* dpp) override;
     virtual int delete_obj_attrs(const DoutPrefixProvider* dpp, RGWObjectCtx* rctx, const char* attr_name, optional_yield y) override;
     virtual bool is_expired() override;
@@ -742,6 +776,7 @@ class MotrObject : public Object {
                                     std::string delete_key, std::string bucket_index_iname,
                                     std::string bucket_name);
     uint64_t get_processed_bytes() { return processed_bytes; }
+    std::string get_key_str();
 };
 
 // A placeholder locking class for multipart upload.
@@ -968,6 +1003,10 @@ class MotrStore : public Store {
     MotrMetaCache* user_cache;
     MotrMetaCache* bucket_inst_cache;
 
+    std::unique_ptr<MotrGC> motr_gc;
+    bool use_gc_threads;
+    bool use_cache;
+
   public:
     CephContext *cctx;
     struct m0_client   *instance;
@@ -1083,7 +1122,14 @@ class MotrStore : public Store {
         uint64_t olh_epoch,
         const std::string& unique_tag) override;
 
+    virtual int initialize(CephContext *cct, const DoutPrefixProvider *dpp);
     virtual void finalize(void) override;
+    int create_gc();
+    void stop_gc();
+    bool gc_enabled() { return use_gc_threads; }
+    std::unique_ptr<MotrGC>& get_gc() { return motr_gc; }
+    MotrStore& set_run_gc_thread(bool _use_gc_thread);
+    MotrStore& set_use_cache(bool _use_cache);
 
     virtual CephContext *ctx(void) override {
       return cctx;
@@ -1096,7 +1142,9 @@ class MotrStore : public Store {
     virtual void set_luarocks_path(const std::string& path) override {
       luarocks_path = path;
     }
-
+    
+    int list_gc_objs(std::vector<std::unordered_map<std::string, std::string>>& gc_entries,
+                                    std::vector<std::string>& inac_queues);
     void close_idx(struct m0_idx *idx) { m0_idx_fini(idx); }
     int do_idx_op(struct m0_idx *, enum m0_idx_opcode opcode,
       std::vector<uint8_t>& key, std::vector<uint8_t>& val, bool update = false);
@@ -1119,7 +1167,7 @@ class MotrStore : public Store {
     int delete_access_key(const DoutPrefixProvider *dpp, optional_yield y, std::string access_key);
     int store_email_info(const DoutPrefixProvider *dpp, optional_yield y, MotrEmailInfo& email_info);
 
-    int init_metadata_cache(const DoutPrefixProvider *dpp, CephContext *cct, bool use_cache);
+    int init_metadata_cache(const DoutPrefixProvider *dpp, CephContext *cct);
     MotrMetaCache* get_obj_meta_cache() {return obj_meta_cache;}
     MotrMetaCache* get_user_cache() {return user_cache;}
     MotrMetaCache* get_bucket_inst_cache() {return bucket_inst_cache;}
