@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.16)
 
 project(ceph
-  VERSION 17.0.0
+  VERSION 17.2.3
   LANGUAGES CXX C ASM)
 
 cmake_policy(SET CMP0028 NEW)
@@ -20,6 +20,12 @@ endif()
 
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_SOURCE_DIR}/cmake/modules/")
 
+if(NOT CMAKE_BUILD_TYPE AND EXISTS "${CMAKE_SOURCE_DIR}/.git")
+  set(default_build_type "Debug")
+  set(CMAKE_BUILD_TYPE "${default_build_type}" CACHE
+      STRING "Default BUILD_TYPE is Debug, other options are: RelWithDebInfo, Release, and MinSizeRel." FORCE)
+endif()
+
 if(CMAKE_SYSTEM_NAME MATCHES "Linux")
   set(LINUX ON)
   FIND_PACKAGE(Threads)
@@ -33,7 +39,15 @@ if(WIN32)
   # the targeted Windows version. The availability of certain functions and
   # structures will depend on it.
   set(WIN32_WINNT "0x0A00" CACHE STRING "Targeted Windows version.")
-  add_definitions(-D_WIN32_WINNT=${WIN32_WINNT})
+  # In order to avoid known winpthread issues, we're using the boost
+  # shared mutex implementation.
+  # https://github.com/msys2/MINGW-packages/issues/3319
+  add_definitions(
+    -D_WIN32_WINNT=${WIN32_WINNT}
+    -DBOOST_THREAD_PROVIDES_GENERIC_SHARED_MUTEX_ON_WIN
+    -DBOOST_THREAD_V2_SHARED_MUTEX
+  )
+  set(Boost_THREADAPI "win32")
 endif()
 
 if(MINGW)
@@ -270,10 +284,16 @@ endif()
 
 option(WITH_BLUEFS "libbluefs library" OFF)
 
+option(WITH_QAT "Enable Qat driver" OFF)
+if(WITH_QAT)
+  find_package(QatDrv REQUIRED COMPONENTS qat_s usdm_drv_s)
+  set(HAVE_QATDRV $(QatDrv_FOUND))
+endif()
+
 option(WITH_QATZIP "Enable QATZIP" OFF)
 if(WITH_QATZIP)
   find_package(qatzip REQUIRED)
-  set(HAVE_QATZIP ${QATZIP_FOUND})
+  set(HAVE_QATZIP ${qatzip_FOUND})
 endif(WITH_QATZIP)
 
 # needs mds and? XXX
@@ -395,7 +415,10 @@ option(WITH_RADOSGW_KAFKA_ENDPOINT "Rados Gateway's pubsub support for Kafka pus
 option(WITH_RADOSGW_LUA_PACKAGES "Rados Gateway's support for dynamically adding lua packagess" ON)
 option(WITH_RADOSGW_DBSTORE "DBStore backend for Rados Gateway" ON)
 option(WITH_RADOSGW_MOTR "CORTX-Motr backend for Rados Gateway" ON)
-option(WITH_RADOSGW_SELECT_PARQUET "Support for s3 select on parquet objects" OFF)
+option(WITH_RADOSGW_SELECT_PARQUET "Support for s3 select on parquet objects" ON)
+
+option(WITH_SYSTEM_ARROW "Use system-provided arrow" OFF)
+option(WITH_SYSTEM_UTF8PROC "Use system-provided utf8proc" OFF)
 
 if(WITH_RADOSGW)
   find_package(EXPAT REQUIRED)
@@ -456,12 +479,8 @@ option(WITH_CEPHFS "CephFS is enabled" ON)
 if(NOT WIN32)
 # Please specify 3.[0-7] if you want to build with a certain version of python3.
 set(WITH_PYTHON3 "3" CACHE STRING "build with specified python3 version")
-if(NOT WITH_PYTHON3 STREQUAL "3")
-  set(find_python3_exact "EXACT")
-endif()
-find_package(Python3 ${WITH_PYTHON3} ${find_python3_exact} REQUIRED
+find_package(Python3 ${WITH_PYTHON3} EXACT REQUIRED
   COMPONENTS Interpreter Development)
-unset(find_python3_exact)
 
 option(WITH_MGR "ceph-mgr is enabled" ON)
 if(WITH_MGR)
@@ -663,8 +682,6 @@ option(WITH_SYSTEMD "build with systemd support" ON)
 add_subdirectory(src)
 
 add_subdirectory(qa)
-add_subdirectory(monitoring)
-
 add_subdirectory(doc)
 if(WITH_MANPAGE)
   add_subdirectory(man)
@@ -679,9 +696,7 @@ if(LINUX)
 endif()
 
 option(WITH_GRAFANA "install grafana dashboards" OFF)
-if(WITH_GRAFANA)
-  add_subdirectory(monitoring/grafana/dashboards)
-endif()
+add_subdirectory(monitoring/ceph-mixin)
 
 CMAKE_DEPENDENT_OPTION(WITH_BOOST_VALGRIND "Boost support for valgrind" OFF
   "NOT WITH_SYSTEM_BOOST" OFF)

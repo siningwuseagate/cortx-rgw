@@ -4243,7 +4243,9 @@ int main(int argc, const char **argv)
 			 OPT::USER_RM,    // --purge-data
 			 OPT::OBJECTS_EXPIRE,
 			 OPT::OBJECTS_EXPIRE_STALE_RM,
-			 OPT::LC_PROCESS
+			 OPT::LC_PROCESS,
+       OPT::BUCKET_SYNC_RUN,
+       OPT::DATA_SYNC_RUN
     };
 
     raw_storage_op = (raw_storage_ops_list.find(opt_cmd) != raw_storage_ops_list.end() ||
@@ -7583,7 +7585,6 @@ next:
   }
 
   if (opt_cmd == OPT::RESHARD_LIST) {
-    list<cls_rgw_reshard_entry> entries;
     int ret;
     int count = 0;
     if (max_entries < 0) {
@@ -7598,19 +7599,20 @@ next:
     formatter->open_array_section("reshard");
     for (int i = 0; i < num_logshards; i++) {
       bool is_truncated = true;
-      string marker;
+      std::string marker;
       do {
-        entries.clear();
+	std::list<cls_rgw_reshard_entry> entries;
         ret = reshard.list(dpp(), i, marker, max_entries - count, entries, &is_truncated);
         if (ret < 0) {
           cerr << "Error listing resharding buckets: " << cpp_strerror(-ret) << std::endl;
           return ret;
         }
-        for (auto iter=entries.begin(); iter != entries.end(); ++iter) {
-          cls_rgw_reshard_entry& entry = *iter;
+        for (const auto& entry : entries) {
           encode_json("entry", entry, formatter.get());
-          entry.get_key(&marker);
         }
+	if (is_truncated) {
+	  entries.crbegin()->get_key(&marker); // last entry's key becomes marker
+	}
         count += entries.size();
         formatter->flush(cout);
       } while (is_truncated && count < max_entries);
@@ -7622,6 +7624,7 @@ next:
 
     formatter->close_section();
     formatter->flush(cout);
+
     return 0;
   }
 
@@ -8347,7 +8350,13 @@ next:
     }
 
     auto num_shards = g_conf()->rgw_md_log_max_shards;
-    ret = crs.run(dpp(), create_admin_meta_log_trim_cr(dpp(), static_cast<rgw::sal::RadosStore*>(store), &http, num_shards));
+    auto mltcr = create_admin_meta_log_trim_cr(
+      dpp(), static_cast<rgw::sal::RadosStore*>(store), &http, num_shards);
+    if (!mltcr) {
+      cerr << "Cluster misconfigured! Unable to trim." << std::endl;
+      return -EIO;
+    }
+    ret = crs.run(dpp(), mltcr);
     if (ret < 0) {
       cerr << "automated mdlog trim failed with " << cpp_strerror(ret) << std::endl;
       return -ret;
@@ -9024,10 +9033,11 @@ next:
   if (opt_cmd == OPT::SYNC_GROUP_FLOW_CREATE) {
     CHECK_TRUE(require_opt(opt_group_id), "ERROR: --group-id not specified", EINVAL);
     CHECK_TRUE(require_opt(opt_flow_id), "ERROR: --flow-id not specified", EINVAL);
-    CHECK_TRUE(require_opt(opt_flow_type,
-                           (symmetrical_flow_opt(*opt_flow_type) ||
-                            directional_flow_opt(*opt_flow_type))),
-                           "ERROR: --flow-type not specified or invalid (options: symmetrical, directional)", EINVAL);
+    CHECK_TRUE(require_opt(opt_flow_type),
+                           "ERROR: --flow-type not specified (options: symmetrical, directional)", EINVAL);
+    CHECK_TRUE((symmetrical_flow_opt(*opt_flow_type) ||
+                            directional_flow_opt(*opt_flow_type)),
+                           "ERROR: --flow-type invalid (options: symmetrical, directional)", EINVAL);
 
     SyncPolicyContext sync_policy_ctx(zonegroup_id, zonegroup_name, opt_bucket);
     ret = sync_policy_ctx.init();
@@ -9074,10 +9084,11 @@ next:
   if (opt_cmd == OPT::SYNC_GROUP_FLOW_REMOVE) {
     CHECK_TRUE(require_opt(opt_group_id), "ERROR: --group-id not specified", EINVAL);
     CHECK_TRUE(require_opt(opt_flow_id), "ERROR: --flow-id not specified", EINVAL);
-    CHECK_TRUE(require_opt(opt_flow_type,
-                           (symmetrical_flow_opt(*opt_flow_type) ||
-                            directional_flow_opt(*opt_flow_type))),
-                           "ERROR: --flow-type not specified or invalid (options: symmetrical, directional)", EINVAL);
+    CHECK_TRUE(require_opt(opt_flow_type),
+                           "ERROR: --flow-type not specified (options: symmetrical, directional)", EINVAL);
+    CHECK_TRUE((symmetrical_flow_opt(*opt_flow_type) ||
+                            directional_flow_opt(*opt_flow_type)),
+                           "ERROR: --flow-type invalid (options: symmetrical, directional)", EINVAL);
 
     SyncPolicyContext sync_policy_ctx(zonegroup_id, zonegroup_name, opt_bucket);
     ret = sync_policy_ctx.init();

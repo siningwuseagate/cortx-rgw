@@ -364,8 +364,11 @@ class PgAutoscaler(MgrModule):
                     if prev_root_id != root_id:
                         overlapped_roots.add(prev_root_id)
                         overlapped_roots.add(root_id)
-                        self.log.error('pool %d has overlapping roots: %s',
-                                       pool_id, overlapped_roots)
+                        self.log.warning("pool %s won't scale due to overlapping roots: %s",
+                                       pool['pool_name'], overlapped_roots)
+                        self.log.warning("Please See: https://docs.ceph.com/en/"
+                                         "latest/rados/operations/placement-groups"
+                                         "/#automated-scaling")
                     break
             if not s:
                 s = CrushSubtreeResourceStatus()
@@ -688,6 +691,8 @@ class PgAutoscaler(MgrModule):
         if osdmap.get_require_osd_release() < 'nautilus':
             return
         pools = osdmap.get_pools_by_name()
+        self.log.debug("pool: {0}".format(json.dumps(pools, indent=4,
+                                sort_keys=True)))
         ps, root_map = self._get_pool_status(osdmap, pools)
 
         # Anyone in 'warn', set the health message for them and then

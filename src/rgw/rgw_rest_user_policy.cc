@@ -294,7 +294,13 @@ void RGWListUserPolicies::execute(optional_yield y)
       s->formatter->close_section();
       s->formatter->open_object_section("ListUserPoliciesResult");
       bufferlist bl = it->second;
-      decode(policies, bl);
+      try {
+        decode(policies, bl);
+      } catch (buffer::error& err) {
+        ldpp_dout(this, 0) << "ERROR: failed to decode user policies" << dendl;
+        op_ret = -EIO;
+        return;
+      }
       s->formatter->open_object_section("PolicyNames");
       for (const auto& p : policies) {
         s->formatter->dump_string("member", p.first);

@@ -127,7 +127,7 @@ bool PgScrubber::verify_against_abort(epoch_t epoch_to_verify)
 	   << " vs last-aborted: " << m_last_aborted << dendl;
 
   // if we were not aware of the abort before - kill the scrub.
-  if (epoch_to_verify > m_last_aborted) {
+  if (epoch_to_verify >= m_last_aborted) {
     scrub_clear_state();
     m_last_aborted = std::max(epoch_to_verify, m_epoch_start);
   }
@@ -146,9 +146,7 @@ bool PgScrubber::should_abort() const
       dout(10) << "nodeep_scrub set, aborting" << dendl;
       return true;
     }
-  }
-
-  if (get_osdmap()->test_flag(CEPH_OSDMAP_NOSCRUB) ||
+  } else if (get_osdmap()->test_flag(CEPH_OSDMAP_NOSCRUB) ||
       m_pg->pool.info.has_flag(pg_pool_t::FLAG_NOSCRUB)) {
     dout(10) << "noscrub set, aborting" << dendl;
     return true;
@@ -188,7 +186,7 @@ void PgScrubber::initiate_regular_scrub(epoch_t epoch_queued)
     m_fsm->process_event(StartScrub{});
     dout(10) << "scrubber event --<< StartScrub" << dendl;
   } else {
-    clear_queued_or_active();
+    clear_queued_or_active();  // also restarts snap trimming
   }
 }
 
@@ -202,7 +200,7 @@ void PgScrubber::initiate_scrub_after_repair(epoch_t epoch_queued)
     m_fsm->process_event(AfterRepairScrub{});
     dout(10) << "scrubber event --<< AfterRepairScrub" << dendl;
   } else {
-    clear_queued_or_active();
+    clear_queued_or_active();  // also restarts snap trimming
   }
 }
 
@@ -1331,6 +1329,8 @@ void PgScrubber::set_op_parameters(requested_scrub_t& request)
 {
   dout(10) << __func__ << " input: " << request << dendl;
 
+  set_queued_or_active(); // we are fully committed now.
+
   // write down the epoch of starting a new scrub. Will be used
   // to discard stale messages from previous aborted scrubs.
   m_epoch_start = m_pg->get_osdmap_epoch();
@@ -1617,8 +1617,8 @@ void PgScrubber::handle_scrub_reserve_grant(OpRequestRef op, pg_shard_t from)
   if (m_reservations.has_value()) {
     m_reservations->handle_reserve_grant(op, from);
   } else {
-    derr << __func__ << ": received unsolicited reservation grant from osd " << from
-	 << " (" << op << ")" << dendl;
+    dout(20) << __func__ << ": late/unsolicited reservation grant from osd "
+	 << from << " (" << op << ")" << dendl;
   }
 }
 
@@ -1711,7 +1711,11 @@ void PgScrubber::set_queued_or_active()
 
 void PgScrubber::clear_queued_or_active()
 {
-  m_queued_or_active = false;
+  if (m_queued_or_active) {
+    m_queued_or_active = false;
+    // and just in case snap trimming was blocked by the aborted scrub
+    m_pg->snap_trimmer_scrub_complete();
+  }
 }
 
 bool PgScrubber::is_queued_or_active() const
@@ -1898,11 +1902,6 @@ void PgScrubber::scrub_finish()
       &t);
     int tr = m_osds->store->queue_transaction(m_pg->ch, std::move(t), nullptr);
     ceph_assert(tr == 0);
-
-    if (!m_pg->snap_trimq.empty()) {
-      dout(10) << "scrub finished, requeuing snap_trimmer" << dendl;
-      m_pg->snap_trimmer_scrub_complete();
-    }
   }
 
   if (has_error) {
@@ -2129,6 +2128,10 @@ PgScrubber::PgScrubber(PG* pg)
 void PgScrubber::set_scrub_begin_time()
 {
   scrub_begin_stamp = ceph_clock_now();
+  m_osds->clog->debug() << fmt::format(
+    "{} {} starts",
+    m_pg->info.pgid.pgid,
+    m_mode_desc);
 }
 
 void PgScrubber::set_scrub_duration()
@@ -2137,6 +2140,7 @@ void PgScrubber::set_scrub_duration()
   utime_t duration = stamp - scrub_begin_stamp;
   m_pg->recovery_state.update_stats([=](auto& history, auto& stats) {
     stats.last_scrub_duration = ceill(duration.to_msec()/1000.0);
+    stats.scrub_duration = double(duration);
     return true;
   });
 }
@@ -2162,6 +2166,7 @@ void PgScrubber::cleanup_on_finish()
   requeue_waiting();
 
   reset_internal_state();
+  m_pg->publish_stats_to_osd();
   m_flags = scrub_flags_t{};
 
   // type-specific state clear
@@ -2200,6 +2205,7 @@ void PgScrubber::clear_pgscrub_state()
 
   // type-specific state clear
   _scrub_clear_state();
+  m_pg->publish_stats_to_osd();
 }
 
 void PgScrubber::replica_handling_done()
@@ -2294,6 +2300,11 @@ std::ostream& PgScrubber::gen_prefix(std::ostream& out) const
   } else {
     return out << " scrubber [~] " << fsm_state << ": ";
   }
+}
+
+void PgScrubber::log_cluster_warning(const std::string& warning) const
+{
+  m_osds->clog->do_log(CLOG_WARN, warning);
 }
 
 ostream& PgScrubber::show(ostream& out) const
