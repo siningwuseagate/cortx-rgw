@@ -1882,7 +1882,8 @@ int Client::make_request(MetaRequest *request,
 			 const UserPerm& perms,
 			 InodeRef *ptarget, bool *pcreated,
 			 mds_rank_t use_mds,
-			 bufferlist *pdirbl)
+			 bufferlist *pdirbl,
+			 size_t feature_needed)
 {
   int r = 0;
 
@@ -1966,6 +1967,11 @@ int Client::make_request(MetaRequest *request,
       session = mds_sessions.at(mds);
     }
 
+    if (feature_needed != ULONG_MAX && !session->mds_features.test(feature_needed)) {
+      request->abort(-CEPHFS_EOPNOTSUPP);
+      break;
+    }
+
     // send request.
     send_request(request, session.get());
 
@@ -1982,7 +1988,7 @@ int Client::make_request(MetaRequest *request,
     request->caller_cond = nullptr;
 
     // did we get a reply?
-    if (request->reply) 
+    if (request->reply)
       break;
   }
 
@@ -2322,6 +2328,18 @@ void Client::handle_client_session(const MConstRef<MClientSession>& m)
   switch (m->get_op()) {
   case CEPH_SESSION_OPEN:
     {
+      if (session->state == MetaSession::STATE_OPEN) {
+        ldout(cct, 10) << "mds." << from << " already opened, ignore it"
+                       << dendl;
+        return;
+      }
+      /*
+       * The connection maybe broken and the session in client side
+       * has been reinitialized, need to update the seq anyway.
+       */
+      if (!session->seq && m->get_seq())
+        session->seq = m->get_seq();
+
       feature_bitset_t missing_features(CEPHFS_FEATURES_CLIENT_REQUIRED);
       missing_features -= m->supported_features;
       if (!missing_features.empty()) {
@@ -7610,10 +7628,14 @@ int Client::_getvxattr(
   req->set_string2(xattr_name);
 
   bufferlist bl;
-  int res = make_request(req, perms, nullptr, nullptr, rank, &bl);
+  int res = make_request(req, perms, nullptr, nullptr, rank, &bl,
+                         CEPHFS_FEATURE_OP_GETVXATTR);
   ldout(cct, 10) << __func__ << " result=" << res << dendl;
 
   if (res < 0) {
+    if (res == -CEPHFS_EOPNOTSUPP) {
+      return -CEPHFS_ENODATA;
+    }
     return res;
   }
 
@@ -8173,10 +8195,17 @@ int Client::fill_stat(Inode *in, struct stat *st, frag_info_t *dirstat, nest_inf
   stat_set_mtime_sec(st, in->mtime.sec());
   stat_set_mtime_nsec(st, in->mtime.nsec());
   if (in->is_dir()) {
-    if (cct->_conf->client_dirsize_rbytes)
+    if (cct->_conf->client_dirsize_rbytes) {
       st->st_size = in->rstat.rbytes;
-    else
+    } else if (in->snapid == CEPH_SNAPDIR) {
+      SnapRealm *realm = get_snap_realm_maybe(in->vino().ino);
+      if (realm) {
+        st->st_size = realm->my_snaps.size();
+        put_snap_realm(realm);
+      }
+    } else {
       st->st_size = in->dirstat.size();
+    }
 // The Windows "stat" structure provides just a subset of the fields that are
 // available on Linux.
 #ifndef _WIN32
@@ -8258,10 +8287,17 @@ void Client::fill_statx(Inode *in, unsigned int mask, struct ceph_statx *stx)
     in->mtime.to_timespec(&stx->stx_mtime);
 
     if (in->is_dir()) {
-      if (cct->_conf->client_dirsize_rbytes)
+      if (cct->_conf->client_dirsize_rbytes) {
 	stx->stx_size = in->rstat.rbytes;
-      else
+      } else if (in->snapid == CEPH_SNAPDIR) {
+        SnapRealm *realm = get_snap_realm_maybe(in->vino().ino);
+	if (realm) {
+          stx->stx_size = realm->my_snaps.size();
+          put_snap_realm(realm);
+	}
+      } else {
 	stx->stx_size = in->dirstat.size();
+      }
       stx->stx_blocks = 1;
     } else {
       stx->stx_size = in->size;
