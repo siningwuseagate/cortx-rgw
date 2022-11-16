@@ -133,8 +133,8 @@ Configuring Your Local Environment
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
 The commands in this section configure your local git environment so that it
-generates "Signed-off-by:" tags. They also set up your local environment so
-that it can stay synchronized with the upstream repository.
+generates "Signed-off-by:" tags. These commands also set up your local
+environment so that it can stay synchronized with the upstream repository.
 
 These commands are necessary only during the initial setup of your local
 working copy. Another way to say that is "These commands are necessary
@@ -200,6 +200,9 @@ upstream repository:
 
 This procedure should be followed often, in order to keep your local ``main``
 in sync with upstream ``main``.
+
+If the command ``git status`` returns a line that reads "Untracked files", see
+:ref:`the procedure on updating submodules <update-submodules>`.
 
 .. _bugfix_branch:
 

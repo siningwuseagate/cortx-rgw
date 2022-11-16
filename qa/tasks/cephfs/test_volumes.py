@@ -1673,6 +1673,9 @@ class TestSubvolumeGroups(TestVolumesHelper):
         # clone snapshot which will create '_index' directory
         self._fs_cmd("subvolume", "snapshot", "clone", self.volname, subvolume, snapshot, clone)
 
+        # wait for clone to complete
+        self._wait_for_clone_to_complete(clone)
+
         # remove snapshot
         self._fs_cmd("subvolume", "snapshot", "rm", self.volname, subvolume, snapshot)
 
@@ -1687,6 +1690,11 @@ class TestSubvolumeGroups(TestVolumesHelper):
         self.assertEqual(len(ret_list), len(subvolumegroups))
 
         self.assertEqual(all(elem in subvolumegroups for elem in ret_list), True)
+
+        # cleanup
+        self._fs_cmd("subvolume", "rm", self.volname, clone)
+        for groupname in subvolumegroups:
+            self._fs_cmd("subvolumegroup", "rm", self.volname, groupname)
 
     def test_subvolume_group_ls_for_nonexistent_volume(self):
         # tests the 'fs subvolumegroup ls' command when /volume doesn't exist
@@ -6619,7 +6627,11 @@ class TestSubvolumeSnapshotClones(TestVolumesHelper):
         self._fs_cmd("subvolume", "create", self.volname, subvolume,"--mode=777", "--size", str(osize))
 
         # do IO, write 50 files of 1MB each to exceed quota. This mostly succeeds as quota enforcement takes time.
-        self._do_subvolume_io(subvolume, number_of_files=50)
+        try:
+            self._do_subvolume_io(subvolume, number_of_files=50)
+        except CommandFailedError:
+            # ignore quota enforcement error.
+            pass
 
         # snapshot subvolume
         self._fs_cmd("subvolume", "snapshot", "create", self.volname, subvolume, snapshot)
