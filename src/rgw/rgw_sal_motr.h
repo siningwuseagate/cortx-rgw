@@ -41,6 +41,7 @@ class MotrGC;
 namespace rgw::sal {
 
 class MotrStore;
+class MotrObjectMeta;
 
 // Global Motr indices
 #define RGW_MOTR_USERS_IDX_NAME       "motr.rgw.users"
@@ -552,6 +553,55 @@ public:
   int handle_data(bufferlist& bl, off_t bl_ofs, off_t bl_len) override;
 };
 
+// motr object metadata stored in index
+struct MotrObjectMeta {
+  struct m0_uint128 oid = {};
+  struct m0_fid pver = {};
+  uint64_t layout_id = 0;
+
+  bool is_composite = false;
+  struct m0_uint128 top_layer_oid = {};
+
+  std::string oid_str() {
+    std::ostringstream oid_stream;
+    oid_stream << "0x" << std::hex << oid.u_hi
+    << ":0x" << oid.u_lo;
+    return oid_stream.str();
+  }
+
+  void encode(bufferlist& bl) const
+  {
+    ENCODE_START(6, 6, bl);
+    encode(oid.u_hi, bl);
+    encode(oid.u_lo, bl);
+    encode(pver.f_container, bl);
+    encode(pver.f_key, bl);
+    encode(layout_id, bl);
+    encode(is_composite, bl);
+    if (is_composite) {
+      encode(top_layer_oid.u_hi, bl);
+      encode(top_layer_oid.u_lo, bl);
+    }
+    ENCODE_FINISH(bl);
+  }
+
+  void decode(bufferlist::const_iterator& bl)
+  {
+    DECODE_START(6, bl);
+    decode(oid.u_hi, bl);
+    decode(oid.u_lo, bl);
+    decode(pver.f_container, bl);
+    decode(pver.f_key, bl);
+    decode(layout_id, bl);
+    decode(is_composite, bl);
+    if (is_composite) {
+      decode(top_layer_oid.u_hi, bl);
+      decode(top_layer_oid.u_lo, bl);
+    }
+    DECODE_FINISH(bl);
+  }
+};
+
 class MotrObject : public Object {
   private:
     MotrStore *store;
@@ -577,44 +627,8 @@ class MotrObject : public Object {
 
   public:
 
-    // motr object metadata stored in index
-    struct Meta {
-      struct m0_uint128 oid = {};
-      struct m0_fid pver = {};
-      uint64_t layout_id = 0;
-
-      std::string oid_str() {
-        std::ostringstream oid_stream;
-        oid_stream << "0x" << std::hex << oid.u_hi
-                   << ":0x" << oid.u_lo;
-        return oid_stream.str();
-      }
-
-      void encode(bufferlist& bl) const
-      {
-        ENCODE_START(5, 5, bl);
-        encode(oid.u_hi, bl);
-        encode(oid.u_lo, bl);
-        encode(pver.f_container, bl);
-        encode(pver.f_key, bl);
-        encode(layout_id, bl);
-        ENCODE_FINISH(bl);
-      }
-
-      void decode(bufferlist::const_iterator& bl)
-      {
-        DECODE_START(5, bl);
-        decode(oid.u_hi, bl);
-        decode(oid.u_lo, bl);
-        decode(pver.f_container, bl);
-        decode(pver.f_key, bl);
-        decode(layout_id, bl);
-        DECODE_FINISH(bl);
-      }
-    };
-
-    struct m0_obj     *mobj = NULL;
-    Meta               meta;
+    struct m0_obj *mobj = NULL;
+    MotrObjectMeta meta;
 
     struct MotrReadOp : public ReadOp {
       private:
@@ -749,7 +763,7 @@ class MotrObject : public Object {
 
   public:
     bool is_opened() { return mobj != NULL; }
-    int create_mobj(const DoutPrefixProvider *dpp, uint64_t sz);
+    int create_mobj(const DoutPrefixProvider *dpp, uint64_t sz, bool store_own_meta = true);
     int open_mobj(const DoutPrefixProvider *dpp);
     int delete_mobj(const DoutPrefixProvider *dpp);
     void close_mobj();
@@ -757,6 +771,34 @@ class MotrObject : public Object {
     int read_mobj(const DoutPrefixProvider* dpp, int64_t start, int64_t end, RGWGetDataCB* cb);
     unsigned get_optimal_bs(unsigned len, bool last=false);
     unsigned get_unit_sz();
+    std::string get_obj_fid_str() {
+      char fid_str[M0_FID_STR_LEN];
+      snprintf(fid_str, ARRAY_SIZE(fid_str), U128X_F, U128_P(&meta.oid));
+      return std::string(fid_str);
+    }
+    void set_chunk_io_sz(int64_t sz) { chunk_io_sz = sz; };
+
+    // Helper member functions for composite object.
+    int create_hsm_enabled_mobj(const DoutPrefixProvider *dpp, uint64_t sz);
+    int create_composite_obj(const DoutPrefixProvider *dpp, uint64_t sz, struct m0_uint128 *layer_oid);
+    int add_composite_layer(const DoutPrefixProvider *dpp, int priority, struct m0_uint128 *layer_oid);
+    int add_composite_layer_extents(const DoutPrefixProvider *dpp,
+                                    struct m0_uint128 layer_oid,
+                                    std::vector<std::pair<uint64_t, uint64_t>>& exts, bool is_write);
+    int delete_hsm_enabled_mobj(const DoutPrefixProvider *dpp);
+    int delete_composite_obj(const DoutPrefixProvider *dpp);
+    int delete_composite_layer(const DoutPrefixProvider *dpp, struct m0_uint128 layer_oid);
+    int delete_composite_layer_extents(const DoutPrefixProvider *dpp,
+                                       struct m0_uint128 layer_oid,
+                                       std::vector<std::pair<uint64_t, uint64_t>>& exts);
+    int list_composite_layers(const DoutPrefixProvider *dpp,
+                              std::vector<struct m0_uint128>& layer_oids);
+    int list_composite_layer_extents(const DoutPrefixProvider *dpp,
+                                     struct m0_uint128 layer_oid,
+                                     int max_ext_num,
+                                     std::vector<std::pair<uint64_t, uint64_t>>& exts,
+                                     uint64_t curr_off, uint64_t *next_off,
+                                     bool *truncated);
 
     int get_part_objs(const DoutPrefixProvider *dpp,
                       std::map<int, std::unique_ptr<MotrObject>>& part_objs);
@@ -846,7 +888,7 @@ protected:
   rgw::sal::MotrStore* store;
 
   // Head object.
-  std::unique_ptr<rgw::sal::Object> head_obj;
+  std::unique_ptr<MotrObject> head_obj;
 
   // Part parameters.
   const uint64_t part_num;
@@ -855,18 +897,25 @@ protected:
   uint64_t actual_part_size = 0;
   // Part object size available from Content-Length header
   uint64_t expected_part_size = 0;
+
+  MultipartUpload *upload;
   const std::string upload_id;
+
+  int store_part_info(const DoutPrefixProvider *dpp, RGWUploadPartInfo info,
+                      std::map<std::string, bufferlist>& attrs);
 
 public:
   MotrMultipartWriter(const DoutPrefixProvider *dpp,
-		       optional_yield y, MultipartUpload* upload,
-		       std::unique_ptr<rgw::sal::Object> _head_obj,
-		       MotrStore* _store,
-		       const rgw_user& owner, RGWObjectCtx& obj_ctx,
-		       const rgw_placement_rule *ptail_placement_rule,
-		       uint64_t _part_num, const std::string& part_num_str) :
-				  Writer(dpp, y), store(_store), head_obj(std::move(_head_obj)),
-				  part_num(_part_num), part_num_str(part_num_str), upload_id(upload->get_upload_id())
+		      optional_yield y, MultipartUpload* _upload,
+		      std::unique_ptr<rgw::sal::Object> _head_obj,
+		      MotrStore* _store,
+		      const rgw_user& owner, RGWObjectCtx& obj_ctx,
+		      const rgw_placement_rule *ptail_placement_rule,
+		      uint64_t _part_num, const std::string& part_num_str) :
+	              Writer(dpp, y), store(_store),
+		      head_obj(static_cast<MotrObject *>(_head_obj.release())),
+		      part_num(_part_num), part_num_str(part_num_str),
+		      upload(_upload), upload_id(_upload->get_upload_id())
   {
     struct req_state *s = static_cast<struct req_state *>(obj_ctx.get_private());
     if (s) {
@@ -875,6 +924,42 @@ public:
     }
   }
   ~MotrMultipartWriter() = default;
+
+  // prepare to start processing object data
+  virtual int prepare(optional_yield y) override;
+
+  // Process a bufferlist
+  virtual int process(bufferlist&& data, uint64_t offset) override;
+
+  // complete the operation and make its result visible to clients
+  virtual int complete(size_t accounted_size, const std::string& etag,
+                       ceph::real_time *mtime, ceph::real_time set_mtime,
+                       std::map<std::string, bufferlist>& attrs,
+                       ceph::real_time delete_at,
+                       const char *if_match, const char *if_nomatch,
+                       const std::string *user_data,
+                       rgw_zone_set *zones_trace, bool *canceled,
+                       optional_yield y) override;
+};
+
+class MotrMultipartCompositeWriter : public MotrMultipartWriter {
+protected:
+  MotrObjectMeta composite_obj_meta;
+
+public:
+  MotrMultipartCompositeWriter(const DoutPrefixProvider *dpp,
+		      optional_yield y, MultipartUpload* upload,
+		      std::unique_ptr<rgw::sal::Object> _head_obj,
+		      MotrStore* _store,
+		      const rgw_user& owner, RGWObjectCtx& obj_ctx,
+		      const rgw_placement_rule *ptail_placement_rule,
+		      uint64_t _part_num, const std::string& part_num_str) :
+                      MotrMultipartWriter(dpp, y, upload, std::move(_head_obj), _store, owner,
+			           obj_ctx, ptail_placement_rule, _part_num, part_num_str)
+  {
+    composite_obj_meta = head_obj->meta;
+  }
+  ~MotrMultipartCompositeWriter() = default;
 
   // prepare to start processing object data
   virtual int prepare(optional_yield y) override;
@@ -924,9 +1009,9 @@ protected:
   RGWUploadPartInfo info;
 
 public:
-  MotrObject::Meta  meta;
+  MotrObjectMeta  meta;
 
-  MotrMultipartPart(RGWUploadPartInfo _info, MotrObject::Meta _meta) :
+  MotrMultipartPart(RGWUploadPartInfo _info, MotrObjectMeta _meta) :
     info(_info), meta(_meta) {}
   virtual ~MotrMultipartPart() = default;
 
@@ -950,11 +1035,13 @@ class MotrMultipartUpload : public MultipartUpload {
   RGWObjManifest manifest;
   std::string version_id;
 
+  bool hsm_enabled = false;
+  MotrObjectMeta meta;
+
 public:
   MotrMultipartUpload(MotrStore* _store, Bucket* _bucket, const std::string& oid,
                       std::optional<std::string> upload_id, ACLOwner _owner, ceph::real_time _mtime) :
-       MultipartUpload(_bucket), store(_store), mp_obj(oid, upload_id), owner(_owner), mtime(_mtime) {
-       }
+       MultipartUpload(_bucket), store(_store), mp_obj(oid, upload_id), owner(_owner), mtime(_mtime) {}
   virtual ~MotrMultipartUpload() = default;
 
   void set_version_id(std::string _version_id) { version_id = _version_id; };
@@ -991,6 +1078,7 @@ public:
 			  uint64_t part_num,
 			  const std::string& part_num_str) override;
   int delete_parts(const DoutPrefixProvider *dpp, std::string version_id="", uint64_t* size_rounded = nullptr);
+  MotrObjectMeta get_motr_obj_meta() {return meta;}
 };
 
 class MotrStore : public Store {
@@ -1014,6 +1102,7 @@ class MotrStore : public Store {
     struct m0_realm     uber_realm;
     struct m0_config    conf = {};
     struct m0_idx_dix_config dix_conf = {};
+    bool hsm_enabled;
 
     MotrStore(CephContext *c): zone(this), cctx(c) {}
     ~MotrStore() {

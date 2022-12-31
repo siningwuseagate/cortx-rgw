@@ -17,6 +17,40 @@
 #include <ctime>
 #include "motr/sync/motr_sync_impl.h"
 
+void motr_gc_obj_info::encode(bufferlist &bl) const
+{
+  ENCODE_START(11, 2, bl);
+  encode(tag, bl);
+  encode(name, bl);
+  encode(mobj->oid.u_hi, bl);
+  encode(mobj->oid.u_lo, bl);
+  encode(mobj->pver.f_container, bl);
+  encode(mobj->pver.f_key, bl);
+  encode(mobj->layout_id, bl);
+  encode(deletion_time, bl);
+  encode(size, bl);
+  encode(is_multipart, bl);
+  encode(multipart_iname, bl);
+  ENCODE_FINISH(bl);
+}
+
+void motr_gc_obj_info::decode(bufferlist::const_iterator &bl)
+{
+  DECODE_START_LEGACY_COMPAT_LEN_32(11, 2, 2, bl);
+  decode(tag, bl);
+  decode(name, bl);
+  decode(mobj->oid.u_hi, bl);
+  decode(mobj->oid.u_lo, bl);
+  decode(mobj->pver.f_container, bl);
+  decode(mobj->pver.f_key, bl);
+  decode(mobj->layout_id, bl);
+  decode(deletion_time, bl);
+  decode(size, bl);
+  decode(is_multipart, bl);
+  decode(multipart_iname, bl);
+  DECODE_FINISH(bl);
+}
+
 void *MotrGC::GCWorker::entry() {
   std::unique_lock<std::mutex> lk(lock);
   ldpp_dout(dpp, 10) << __func__ << ": " << gc_thread_prefix
@@ -84,7 +118,7 @@ void *MotrGC::GCWorker::entry() {
           // GC queues. With large number of parts, a gc thread may exhaust its 
           // alloted time, in that case it will be preempted and remaining parts
           // will be processed in next cycle
-          rc = motr_gc->process_parts(ginfo, end_time);
+          rc = motr_gc->delete_multipart_obj_from_gc(ginfo, end_time);
           if (rc < 0 && rc != -ETIMEDOUT) {
             ldpp_dout(dpp, 0) << gc_log_prefix << __func__
                     << ": ERROR: failed to distribute multipart object " 
@@ -251,15 +285,26 @@ uint32_t MotrGC::get_max_indices() {
 }
 
 int MotrGC::delete_obj_from_gc(motr_gc_obj_info ginfo) {
-  int rc = delete_motr_obj(ginfo.mobj);
+  int rc = 0;
+
+  if (ginfo.mobj->is_composite) {
+    std::unique_ptr<rgw::sal::Object> obj;
+    obj = store->get_object(rgw_obj_key(ginfo.name));
+    std::unique_ptr<rgw::sal::MotrObject> motr_obj(static_cast<rgw::sal::MotrObject *>(obj.release()));
+    motr_obj->meta = *ginfo.mobj;
+    motr_obj->delete_hsm_enabled_mobj(nullptr);
+  } else
+    rc = delete_motr_obj(*ginfo.mobj);
   return rc;
 }
 
-int MotrGC::process_parts(motr_gc_obj_info ginfo, std::time_t end_time) {
+int MotrGC::delete_multipart_obj_from_gc(motr_gc_obj_info ginfo, std::time_t end_time)
+{
   int rc = 0;
   int max_entries = 10000;
   std::vector<std::string> keys(max_entries);
   std::vector<bufferlist> vals(max_entries);
+  auto meta = new rgw::sal::MotrObjectMeta();
 
   keys[0] = ginfo.name;
   rc = store->next_query_by_name(ginfo.multipart_iname, keys, vals, ginfo.name);
@@ -277,24 +322,18 @@ int MotrGC::process_parts(motr_gc_obj_info ginfo, std::time_t end_time) {
     info.decode(iter);
     rgw::sal::Attrs attrs_dummy;
     decode(attrs_dummy, iter);
-    Meta mobj;
-    mobj.decode(iter);
+    meta->decode(iter);
     ldout(cct, 20) <<__func__<< ": part_num=" << info.num
                              << " part_size=" << info.size << dendl;
-    std::string tag = mobj.oid_str();
+
+    std::string tag = meta->oid_str();
     std::string part_name = "part.";
     char buff[32];
     snprintf(buff, sizeof(buff), "%08d", (int)info.num);
     part_name.append(buff);
 
-    std::string obj_fqdn = ginfo.name + "." + part_name;
-    motr_gc_obj_info gc_obj(tag, obj_fqdn, mobj, ginfo.deletion_time, info.size);
-    rc = enqueue(gc_obj);
-    if (rc < 0) {
-      ldout(cct, 0) <<__func__<< ": ERROR: failed to push " 
-                          << obj_fqdn << "into GC queue " << dendl;
-      continue;
-    }
+    // Sining: one Motr op per part, this is not efficient.
+    // TODO: do in batch.
     bufferlist bl_del;
     int index = &bl - &vals[0];
     rc = store->do_idx_op_by_name(ginfo.multipart_iname,
@@ -302,17 +341,41 @@ int MotrGC::process_parts(motr_gc_obj_info ginfo, std::time_t end_time) {
     if (rc < 0) {
       ldout(cct, 0) <<__func__<< ": ERROR: failed to remove part " << part_name 
                       << " from part index " << ginfo.multipart_iname << dendl;
+       continue;
     }
+
+    if (meta->is_composite)
+      continue;
+
+    std::string obj_fqdn = ginfo.name + "." + part_name;
+    motr_gc_obj_info gc_obj(tag, obj_fqdn, meta, ginfo.deletion_time, info.size);
+    rc = enqueue(gc_obj);
+    if (rc < 0)
+      ldout(cct, 0) <<__func__<< ": ERROR: failed to push " 
+                          << obj_fqdn << "into GC queue " << dendl;
+
     if (std::time(nullptr) > end_time || going_down()) {
       // processing time's up, so return now
       return -ETIMEDOUT;
     }
   }
 
+  // Put the composite object into the queue.
+  if (meta->is_composite) {
+    std::string tag = meta->oid_str();
+    std::string obj_fqdn = ginfo.name;
+    motr_gc_obj_info gc_obj(tag, obj_fqdn, meta, ginfo.deletion_time, ginfo.size);
+    rc = enqueue(gc_obj);
+    if (rc < 0)
+      ldout(cct, 0) <<__func__<< ": ERROR: failed to push " 
+                          << obj_fqdn << "into GC queue " << dendl;
+  }
+
+  delete meta;
   return rc;
 }
 
-int MotrGC::delete_motr_obj(Meta motr_obj) {
+int MotrGC::delete_motr_obj(rgw::sal::MotrObjectMeta motr_obj) {
   int rc;
   struct m0_op *op = nullptr;
 

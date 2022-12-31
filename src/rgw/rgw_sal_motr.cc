@@ -1785,10 +1785,13 @@ int MotrObject::set_obj_attrs(const DoutPrefixProvider* dpp, RGWObjectCtx* rctx,
 int MotrObject::get_obj_attrs(RGWObjectCtx* rctx, optional_yield y, const DoutPrefixProvider* dpp, rgw_obj* target_obj)
 {
   req_state *s = (req_state *) rctx->get_private();
-  string req_method = s->info.method;
-  /* TODO: Temp fix: Enabled Multipart-GET Obj. and disabled other multipart request methods */
-  if (this->category == RGWObjCategory::MultiMeta && (req_method == "POST" || req_method == "PUT"))
-   return 0;
+  // if ::get_obj_attrs() is called from radosgw-admin, s will be nullptr.
+  if (s != nullptr) {
+     string req_method = s->info.method;
+    /* TODO: Temp fix: Enabled Multipart-GET Obj. and disabled other multipart request methods */
+    if (this->category == RGWObjCategory::MultiMeta && (req_method == "POST" || req_method == "PUT"))
+     return 0;
+  }
 
   int rc;
   rgw_bucket_dir_entry ent;
@@ -1798,6 +1801,12 @@ int MotrObject::get_obj_attrs(RGWObjectCtx* rctx, optional_yield y, const DoutPr
       ldpp_dout(dpp, LOG_ERROR) <<__func__ << ": ERROR: Failed to get key or object's entry from bucket index. rc=" << rc << dendl;
       return rc;
   }
+
+  // get_obj_attrs() is called when radosgw-admin executes "object stat" cmd.
+  bufferlist obj_fid_bl;
+  std::string obj_fid_str = this->get_obj_fid_str();
+  obj_fid_bl.append(obj_fid_str.c_str(), obj_fid_str.size());
+  attrs.emplace(std::move(RGW_ATTR_META_PREFIX "motr-obj-fid"), std::move(obj_fid_bl));
 
   return 0;
 }
@@ -1969,8 +1978,18 @@ int MotrObject::MotrReadOp::prepare(optional_yield y, const DoutPrefixProvider* 
   source->set_key(ent.key);
   source->set_obj_size(ent.meta.size);
   source->category = ent.meta.category;
-  *params.lastmod = ent.meta.mtime;
 
+  // ReadOp::prepare() is called when processing OBJECT GET or INFO
+  // request from s3 client, adding the object id to attrs will
+  // expose internal details to client user, will this be a security
+  // concern? If a user can access an object and its metadata, it
+  // must have permission to do so, it should be O.K?
+  bufferlist obj_fid_bl;
+  std::string obj_fid_str = source->get_obj_fid_str();
+  obj_fid_bl.append(obj_fid_str.c_str(), obj_fid_str.size());
+  source->get_attrs().emplace(std::move(RGW_ATTR_META_PREFIX "motr-obj-fid"), std::move(obj_fid_bl));
+
+  *params.lastmod = ent.meta.mtime;
   if (params.mod_ptr || params.unmod_ptr) {
     // Convert all times go GMT to make them compatible
     obj_time_weight src_weight;
@@ -2045,7 +2064,10 @@ int MotrObject::MotrReadOp::iterate(const DoutPrefixProvider* dpp, int64_t off, 
 
   addb_logger.set_id(rctx);
 
-  if (source->category == RGWObjCategory::MultiMeta) {
+  // Note that a composite object can be read just like a 
+  // ordinary object.
+  if (source->category == RGWObjCategory::MultiMeta &&
+      !source->meta.is_composite) {
     ldpp_dout(dpp, 20) <<__func__ << ": open obj parts..." << dendl;
     rc = source->get_part_objs(dpp, this->part_objs)? :
          source->open_part_objs(dpp, this->part_objs);
@@ -2264,8 +2286,8 @@ int MotrObject::remove_mobj_and_index_entry(
           std::string obj_fqdn = this->get_name() + "." + upload_id;
           std::string iname = "motr.rgw.bucket." + bucket_name + ".multiparts";
           ldpp_dout(dpp, 20) << __func__ << ": object part index=" << iname << dendl;
-          ::Meta *mobj = reinterpret_cast<::Meta*>(&this->meta);
-          motr_gc_obj_info gc_obj(upload_id, obj_fqdn, *mobj, std::time(nullptr),
+          //MotrObjectMeta *mobj = reinterpret_cast<MotrObjectMeta*>(&this->meta);
+          motr_gc_obj_info gc_obj(upload_id, obj_fqdn, &this->meta, std::time(nullptr),
                                   ent.meta.size, iname);
           rc = store->get_gc()->enqueue(gc_obj);
           if (rc == 0) {
@@ -2277,7 +2299,11 @@ int MotrObject::remove_mobj_and_index_entry(
         }
       }
       if (!pushed_to_gc) {
-        rc = this->delete_part_objs(dpp, &size_rounded);
+        if (this->meta.is_composite)
+          rc = this->delete_part_objs(dpp, &size_rounded)? : // Remove part info only.
+   	       this->delete_hsm_enabled_mobj(dpp);
+	else
+          rc = this->delete_part_objs(dpp, &size_rounded);
       }
     } else {
       // Handling Simple Object Deletion
@@ -2295,8 +2321,8 @@ int MotrObject::remove_mobj_and_index_entry(
       if (store->gc_enabled()) {
         std::string tag = this->meta.oid_str();
         std::string obj_fqdn = bucket_name + "/" + delete_key;
-        ::Meta *mobj = reinterpret_cast<::Meta*>(&this->meta);
-        motr_gc_obj_info gc_obj(tag, obj_fqdn, *mobj, std::time(nullptr),
+        //MotrObjectMeta *mobj = reinterpret_cast<MotrObjectMeta*>(&this->meta);
+        motr_gc_obj_info gc_obj(tag, obj_fqdn, &this->meta, std::time(nullptr),
                                 ent.meta.size);
         rc = store->get_gc()->enqueue(gc_obj);
         if (rc == 0) {
@@ -2306,8 +2332,11 @@ int MotrObject::remove_mobj_and_index_entry(
                                << " to motr garbage collector." << dendl;
         }
       }
+
+      ldpp_dout(dpp, 0) <<__func__ << "[sining]: don't push to gc" << dendl;
       if (! pushed_to_gc)
-        rc = this->delete_mobj(dpp);
+        rc = this-meta.is_composite? 
+	     this->delete_hsm_enabled_mobj(dpp) : this->delete_mobj(dpp);
     }
     if (rc < 0) {
       ldpp_dout(dpp, LOG_ERROR) <<__func__ << ": ERROR: Failed to delete the object " << delete_key  <<" from Motr." << dendl;
@@ -2704,7 +2733,465 @@ int MotrAtomicWriter::prepare(optional_yield y)
   return rc;
 }
 
-int MotrObject::create_mobj(const DoutPrefixProvider *dpp, uint64_t sz)
+#define M0_OP_EXEC_SYNC(op, rc) \
+do { \
+  m0_op_launch(&op, 1); \
+  rc = m0_op_wait(op, M0_BITS(M0_OS_FAILED, M0_OS_STABLE), M0_TIME_NEVER) ?: \
+       m0_rc(op); \
+  m0_op_fini(op); \
+  m0_op_free(op); \
+  op = nullptr; \
+ \
+} while(0)
+
+int MotrObject::create_hsm_enabled_mobj(const DoutPrefixProvider *dpp, uint64_t sz)
+{
+  // Note that the extents are created when a whole write op is done as
+  // the offset and size are known then.
+  struct m0_uint128 top_layer_oid;
+  int rc = create_composite_obj(dpp, sz, &top_layer_oid);
+  if (rc == 0) {
+    this->meta.is_composite = true;
+    this->meta.top_layer_oid = top_layer_oid;
+  }
+  return rc;
+}
+
+int MotrObject::create_composite_obj(const DoutPrefixProvider *dpp, uint64_t sz,
+                                     struct m0_uint128 *layer_oid)
+{
+  // Creating a composite object includes 2 steps:
+  // (1) Create a `normal` object.
+  // (2) Set composite layout for this newly created object.
+  //
+  // The decision to not pack the above 2 steps in is to handle failures
+  // properly. A failure could happen in creating a `normal` object or
+  // setting composite layout, which requires different clear-up handling.
+  //
+  // Note: MIO only supports creating a composite object from a newly created
+  // one (not yet written any data). As a composite object will be accessed
+  // by HSM tool, the object's metadata has to be stored in Motr, so set
+  // the 'store_own_meta' flag to be false for create_mobj().
+  ldpp_dout(dpp, 0) <<__func__ << "[sining]: create a normal object" << dendl;
+  int rc = this->create_mobj(dpp, sz, false);
+  if (rc != 0)
+    return rc;
+
+  // Add a top layer and an extent to cover the whole top layer.
+  std::vector<std::pair<uint64_t, uint64_t>> exts;
+  exts.emplace_back(std::pair<uint64_t, uint64_t>(0, M0_BCOUNT_MAX));
+  rc = add_composite_layer(dpp, -1, layer_oid)? :
+       add_composite_layer_extents(dpp, *layer_oid, exts, true) ? :
+       add_composite_layer_extents(dpp, *layer_oid, exts, false);
+  if (rc != 0) {
+    this->delete_mobj(dpp);
+    return rc;
+  }
+  
+  return 0;
+}
+
+int MotrObject::add_composite_layer(const DoutPrefixProvider *dpp, int priority,
+                                    struct m0_uint128 *layer_oid)
+{
+  struct m0_client_layout *layout = nullptr; 
+  struct m0_obj *layer_obj = nullptr;
+  uint64_t lid = M0_OBJ_LAYOUT_ID(meta.layout_id);
+  struct m0_op *op = nullptr;
+  bool layout_is_alloced = false;
+  ldpp_dout(dpp, 0) <<__func__ << "[sining]: enter" << dendl;
+
+  // Generate an object id for the top layer.
+  // Must be conherent with Motr HSM API's defintion on layer ID.
+  M0_ASSERT(layer_oid != nullptr);
+  memset(layer_oid, 0, sizeof(*layer_oid));
+  int rc = m0_ufid_next(&ufid_gr, 1, layer_oid);
+  if (rc != 0) {
+    ldpp_dout(dpp, LOG_ERROR) <<__func__ << ": ERROR: m0_ufid_next() failed: " << rc << dendl;
+    return rc;
+  } 
+  if (priority == -1) {
+    int32_t gen = 0;
+    uint8_t top_tier = 0;
+    priority = ((0x00FFFFFF - gen) << 8) | top_tier;
+  }
+  //layer_oid->u_hi <<= 32;
+  //layer_oid->u_hi |= (1LL << 31);
+  //layer_oid->u_hi |= priority;
+
+  ldpp_dout(dpp, 0) <<__func__ << "[sining]: layer_oid=[0x" << std::hex << layer_oid->u_hi
+                                  << ":0x" << std::hex << layer_oid->u_lo 
+                                  << "], layout_id=0x" << std::hex << lid << dendl;
+
+  // Create an object for this layer.
+  ldpp_dout(dpp, 0) <<__func__ << "[sining]: create a layer object" << dendl;
+  layer_obj = new m0_obj();
+  m0_obj_init(layer_obj, &store->container.co_realm, layer_oid, lid);
+  layer_obj->ob_entity.en_flags |= M0_ENF_GEN_DI;
+  rc = m0_entity_create(nullptr, &layer_obj->ob_entity, &op);
+  if (rc != 0) {
+    ldpp_dout(dpp, LOG_ERROR) <<__func__ << ": ERROR: m0_entity_create() failed, rc=" << rc << dendl;
+    goto error;
+  }
+  M0_OP_EXEC_SYNC(op, rc);
+  if (rc != 0) {
+    ldpp_dout(dpp, LOG_ERROR) <<__func__ << ": ERROR: failed to create motr object. rc=" << rc << dendl;
+    goto error;
+  }
+  ldpp_dout(dpp, 0) <<__func__ << "[sining]: pver = ["
+                                  << "0x" << std::hex << layer_obj->ob_attr.oa_pver.f_container
+				  << ":0x" << std::hex << layer_obj->ob_attr.oa_pver.f_key << "]" << dendl;
+
+  // Update composite object's layout to add the layer.
+  layout = this->mobj->ob_layout; 
+  if (layout == nullptr) {
+    // When an object is newly created, ob_layout is not set until
+    // LAYOUT_SET op is executed.
+    ldpp_dout(dpp, 0) <<__func__ << "[sining]: create a composite layout" << dendl;
+    layout = m0_client_layout_alloc(M0_LT_COMPOSITE);
+    if (layout == NULL) {
+      rc = -ENOMEM;
+      goto error;
+    }
+    layout_is_alloced = true;
+  }
+  ldpp_dout(dpp, 0) <<__func__ << "[sining]: update the layout by adding a new layer" << dendl;
+  rc = m0_composite_layer_add(layout, layer_obj, priority);
+  if (rc != 0)
+    goto error;
+
+  ldpp_dout(dpp, 0) <<__func__ << "[sining]: launch layout op" << dendl;
+  m0_client_layout_op(this->mobj, M0_EO_LAYOUT_SET, layout, &op);
+  M0_OP_EXEC_SYNC(op, rc);
+  if (rc < 0)
+    goto error;
+  return 0;
+
+error:
+  if (layout_is_alloced == true)
+    m0_client_layout_free(layout);
+  if (layer_obj) {
+    rc = m0_entity_delete(&layer_obj->ob_entity, &op);
+    if (rc != 0) {
+      ldpp_dout(dpp, LOG_ERROR) <<__func__ << ": ERROR: m0_entity_delete() failed. rc=" << rc << dendl;
+      return rc;
+    }
+
+    M0_OP_EXEC_SYNC(op, rc);   
+  }
+  return rc;
+}
+
+int MotrObject::add_composite_layer_extents(const DoutPrefixProvider *dpp,
+                                            struct m0_uint128 layer_oid,
+                                            vector<std::pair<uint64_t, uint64_t>>& exts,
+					    bool is_write)
+{
+  struct m0_idx idx = {};
+  char *kbuf;
+  char *vbuf;
+  uint64_t klen;
+  uint64_t vlen;
+
+  ldpp_dout(dpp, 0) <<__func__ << "[sining]: enter" << dendl;
+  int rc = m0_composite_layer_idx(layer_oid, is_write, &idx);
+  ldpp_dout(dpp, 0) <<__func__ << "[sining]: get composite layer idx rc = " << rc << dendl;
+  if (rc != 0) {
+    ldpp_dout(dpp, LOG_ERROR) <<__func__ << ": ERROR: failed to get composite layer index: rc="
+                              << rc << dendl;
+    return rc;
+  }
+
+  for (auto& ext: exts) {
+    struct m0_composite_layer_idx_key ext_key;
+    ext_key.cek_layer_id = layer_oid;
+    ext_key.cek_off = ext.first;
+    struct m0_composite_layer_idx_val ext_val;
+    ext_val.cev_len = ext.second;
+    rc = m0_composite_layer_idx_key_to_buf(&ext_key, (void **)&kbuf, &klen)? :
+         m0_composite_layer_idx_val_to_buf(&ext_val, (void **)&vbuf, &vlen);
+    if (rc < 0)
+      break;
+
+    ldpp_dout(dpp, 0) <<__func__ << "[sining]: layer_oid=[0x" << std::hex << layer_oid.u_hi
+                                 << ":0x" << std::hex << layer_oid.u_lo 
+                                 << "], off =0x" << std::hex << ext.first
+				 << ", len = 0x" << std::hex << ext.second  << ", "
+				 << (is_write? "write" : "read" ) << "ext" << dendl;
+
+    // This is not performance-wise. All key-value pairs should
+    // be sent in one op. Add do_idx_op_batch() in MotrStore.
+    vector<uint8_t> key(klen);
+    vector<uint8_t> val(vlen);
+    memcpy(reinterpret_cast<char*>(key.data()), kbuf, klen);
+    memcpy(reinterpret_cast<char*>(val.data()), vbuf, vlen);
+    ldpp_dout(dpp, 0) <<__func__ << "[sining]: add the extent to idx" << dendl;
+    rc = this->store->do_idx_op(&idx, M0_IC_PUT, key, val);
+    if (rc < 0)
+      break;
+  }
+
+  return rc;
+}
+
+// A new Motr API to parse the Motr composite layout data structure is
+// needed as a privately defined list is used in Motr.
+// Place holder: m0_composite_layer_get().
+// 
+// Ugly Hack: it is done by iterating the layer list via explictly
+// manipulating the list as m0_tl_* APIs are exposed in 'libmotr'.
+
+int MotrObject::list_composite_layers(const DoutPrefixProvider *dpp,
+                                      std::vector<struct m0_uint128>& layer_oids)
+{
+  int rc = 0;
+  struct m0_client_layout *layout; 
+  struct m0_op *op = nullptr;
+
+  layout = m0_client_layout_alloc(M0_LT_COMPOSITE);
+  if (layout == nullptr)
+    return -ENOMEM;
+  m0_client_layout_op(this->mobj, M0_EO_LAYOUT_GET, layout, &op);
+  M0_OP_EXEC_SYNC(op, rc);
+  if (rc < 0)
+    return rc;
+
+  struct m0_client_composite_layout *clayout;
+  clayout = container_of(layout, struct m0_client_composite_layout, ccl_layout);
+  int nr_layers = clayout->ccl_nr_layers;
+  ldpp_dout(dpp, 0) <<__func__ << "[sining]: nr_layers = " << nr_layers << dendl;
+  struct m0_list_link *lnk;
+  struct m0_tlink *tlnk;
+  lnk = clayout->ccl_layers.t_head.l_head;
+  for (int i = 0; i < nr_layers; i++) {
+    if (lnk == NULL)
+      break;
+
+    ldpp_dout(dpp, 0) <<__func__ << "[sining]:  lnk = " << std::hex << lnk << dendl;
+    tlnk = container_of(lnk, struct m0_tlink, t_link);
+    ldpp_dout(dpp, 0) <<__func__ << "[sining]:  tlnk = " << std::hex << tlnk << dendl;
+    struct m0_composite_layer *layer = container_of(tlnk, struct m0_composite_layer, ccr_tlink);
+    ldpp_dout(dpp, 0) <<__func__ << "[sining]:  layer = " << std::hex << layer << dendl;
+    ldpp_dout(dpp, 0) <<__func__ << "[sining]:  emplace" << dendl;
+    layer_oids.emplace_back(layer->ccr_subobj);
+    ldpp_dout(dpp, 0) <<__func__ << "[sining]:  layer oid = [0x" 
+                                 << std::hex << layer->ccr_subobj.u_hi 
+    				 << ":0x" << std::hex  << layer->ccr_subobj.u_lo << "]" << dendl;
+
+    lnk = lnk->ll_next;
+  }
+
+  return 0;
+}
+
+int MotrObject::list_composite_layer_extents(const DoutPrefixProvider *dpp,
+                                             struct m0_uint128 layer_oid,
+				 	     int max_ext_num,
+                                             vector<std::pair<uint64_t, uint64_t>>& exts,
+                                             uint64_t curr_off, uint64_t *next_off,
+					     bool *truncated)
+{
+  unsigned nr_kvp = std::min(max_ext_num, 128);
+  struct m0_idx idx = {};
+  vector<vector<uint8_t>> keys(nr_kvp);
+  vector<vector<uint8_t>> vals(nr_kvp);
+  char *kbuf;
+  uint64_t klen;
+
+  ldpp_dout(dpp, 0) <<__func__ << "[sining]:  layer oid = [0x" 
+                               << std::hex << layer_oid.u_hi 
+                               << ":0x" << std::hex  << layer_oid.u_lo << "]" << dendl;
+  ldpp_dout(dpp, 0) <<__func__ << "[sining]:  enter, get layer idx" << dendl;
+  int rc = m0_composite_layer_idx(layer_oid, true, &idx);
+  if (rc != 0) {
+    ldpp_dout(dpp, LOG_ERROR) <<__func__ << ": ERROR: failed to get composite layer index: rc="
+                              << rc << dendl;
+    return rc;
+  }
+
+  // Only the first element for keys needs to be set for NEXT query.
+  // The keys will be set will the returned keys from motr index.
+  struct m0_composite_layer_idx_key ext_key;
+  ext_key.cek_layer_id = layer_oid;
+  ext_key.cek_off = curr_off;
+  rc = m0_composite_layer_idx_key_to_buf(&ext_key, (void **)&kbuf, &klen);
+  keys[0].insert(keys[0].begin(), kbuf, kbuf + klen);
+  ldpp_dout(dpp, 0) <<__func__ << "[sining]:  query for extents in index" << dendl;
+  rc = this->store->do_idx_next_op(&idx, keys, vals);
+  if (rc < 0) {
+      ldpp_dout(dpp, LOG_ERROR) <<__func__ << ": ERROR: NEXT query failed, rc=" << rc << dendl;
+      return rc;
+  }
+
+  // free(kbuf); ???
+
+  uint64_t last_off = 0;
+  exts.clear();
+
+  ldpp_dout(dpp, 0) <<__func__ << "[sining]:  parse extents" << dendl;
+  int ext_cnt = 0;
+  for (int i = 0; i < int(keys.size()) && ext_cnt < max_ext_num; i++) {
+    auto key = keys[i];
+    auto val = vals[i];
+    if (key.size() == 0 || val.size() == 0)
+      break;
+
+    ldpp_dout(dpp, 0) <<__func__ << "[sining]:  get extent out from buf" << dendl;
+    struct m0_composite_layer_idx_val ext_val;
+    m0_composite_layer_idx_key_from_buf(&ext_key, key.data());
+    m0_composite_layer_idx_val_from_buf(&ext_val, val.data());
+
+    ldpp_dout(dpp, 0) <<__func__ << "[sining]:  layer oid = [0x" 
+                                 << std::hex << ext_key.cek_layer_id.u_hi 
+    				 << ":0x" << std::hex  << ext_key.cek_layer_id.u_lo << "]" 
+				 << ", off = " << std::hex << ext_key.cek_off 
+				 << ", len = " << std::hex << ext_val.cev_len << dendl;
+    if (ext_key.cek_layer_id.u_hi != layer_oid.u_hi ||
+        ext_key.cek_layer_id.u_lo != layer_oid.u_lo)
+      break;
+
+    if (ext_key.cek_off > curr_off) {
+      last_off = ext_key.cek_off;
+      uint64_t ext_off = ext_key.cek_off;
+      uint64_t ext_len = ext_val.cev_len;
+      exts.emplace_back(std::pair<uint64_t, uint64_t>(ext_off, ext_len));
+      ext_cnt++;
+      ldpp_dout(dpp, 0) <<__func__ << "[sining]:  ext_cnt = " << ext_cnt << ", off = " << ext_off << ", len = " << ext_len << dendl;
+    }
+  }
+
+  if (truncated)
+    *truncated = ext_cnt > max_ext_num? true : false;
+
+  if (next_off)
+    *next_off = last_off;
+
+  return 0;
+}
+
+int MotrObject::delete_composite_layer(const DoutPrefixProvider *dpp, struct m0_uint128 layer_oid)
+{
+  int rc;
+  struct m0_client_layout *layout; 
+  struct m0_op *op = nullptr;
+  struct m0_obj layer_obj;
+
+  // Opening an object doesn't retrieve its layout from motr,
+  // get it via LAYOUT_GET.
+  ldpp_dout(dpp, 0) <<__func__ << "[sining]:  retrieve layout then update it" << dendl;
+  layout = m0_client_layout_alloc(M0_LT_COMPOSITE);
+  if (layout == nullptr)
+    return -ENOMEM;
+  m0_client_layout_op(this->mobj, M0_EO_LAYOUT_GET, layout, &op);
+  M0_OP_EXEC_SYNC(op, rc);
+  if (rc < 0)
+    goto exit;	
+  m0_composite_layer_del(layout, layer_oid);
+  m0_client_layout_op(this->mobj, M0_EO_LAYOUT_SET, layout, &op);
+  M0_OP_EXEC_SYNC(op, rc);
+  if (rc < 0)
+    goto exit;
+
+  // Delete this layer's sub-object.
+  ldpp_dout(dpp, 0) <<__func__ << "[sining]:  delete the layer object" << dendl;
+  memset(&layer_obj, 0, sizeof layer_obj);
+  m0_obj_init(&layer_obj, &store->container.co_realm, &layer_oid, store->conf.mc_layout_id);
+  //layer_obj.ob_entity.en_flags |= M0_ENF_GEN_DI;
+  op = nullptr;
+  rc = m0_entity_delete(&layer_obj.ob_entity, &op);
+  if (rc != 0)
+    goto exit;
+  M0_OP_EXEC_SYNC(op, rc);
+
+exit:
+  m0_client_layout_free(layout);
+  return rc;
+}
+
+int MotrObject::delete_composite_layer_extents(const DoutPrefixProvider *dpp,
+                                               struct m0_uint128 layer_oid,
+                                               std::vector<std::pair<uint64_t, uint64_t>>& exts)
+{
+  struct m0_idx idx = {};
+  int rc = m0_composite_layer_idx(layer_oid, true, &idx);
+  if (rc != 0) {
+    ldpp_dout(dpp, LOG_ERROR) <<__func__ << ": ERROR: failed to get composite layer index: rc="
+                              << rc << dendl;
+    return rc;
+  }
+
+  for (auto ext: exts) {
+    struct m0_composite_layer_idx_key ext_key;
+    ext_key.cek_layer_id = layer_oid;
+    ext_key.cek_off = ext.first;
+
+    char *kbuf;
+    uint64_t klen;
+    rc = m0_composite_layer_idx_key_to_buf(&ext_key, (void **)&kbuf, &klen);
+    if (rc < 0)
+      break;
+
+    // TODO: see add_composite_layer_extents().
+    std::vector<uint8_t> key(klen);
+    std::vector<uint8_t> val;
+    memcpy(reinterpret_cast<char*>(key.data()), kbuf, klen);
+    rc = this->store->do_idx_op(&idx, M0_IC_DEL, key, val);
+    if (rc < 0)
+      break;
+  }
+
+  return rc;
+}
+
+int MotrObject::delete_composite_obj(const DoutPrefixProvider *dpp)
+{
+  return this->delete_mobj(dpp);
+}
+
+int MotrObject::delete_hsm_enabled_mobj(const DoutPrefixProvider *dpp)
+{
+  int rc;
+  ldpp_dout(dpp, 0) <<__func__ << "[sining]: open mobj" << dendl;
+  if (this->mobj == nullptr) {
+    rc = this->open_mobj(dpp);
+    if (rc < 0)
+      return rc;
+  }
+
+  // Get layers.
+  std::vector<struct m0_uint128> layer_oids;
+  ldpp_dout(dpp, 0) <<__func__ << "[sining]: list layers" << dendl;
+  rc = list_composite_layers(dpp, layer_oids);
+  if (rc < 0)
+    return rc;
+
+  // For each layers, get all extents and remove all of them.
+  for (auto layer_oid: layer_oids) {
+    int max_ext_num = 128;
+    std::vector<std::pair<uint64_t, uint64_t>> exts;
+    uint64_t next_off = 0;
+    bool truncated = true;
+
+    do {
+      exts.clear();
+      ldpp_dout(dpp, 0) <<__func__ << "[sining]: delete extents of a layer" << dendl;
+      rc = list_composite_layer_extents(dpp, layer_oid, max_ext_num,
+                                        exts, next_off, &next_off, &truncated)? :
+           delete_composite_layer_extents(dpp, layer_oid, exts);
+      if (rc < 0)
+        return rc;
+    } while (truncated);
+
+    rc = delete_composite_layer(dpp, layer_oid);
+    ldpp_dout(dpp, 0) <<__func__ << "[sining]: delete a layer, rc = " << rc << dendl;
+    if (rc < 0)
+      break;
+  }
+
+  return rc;
+}
+
+int MotrObject::create_mobj(const DoutPrefixProvider *dpp, uint64_t sz, bool store_own_meta)
 {
   ADDB(RGW_ADDB_REQUEST_ID, addb_logger.get_id(),
        RGW_ADDB_FUNC_CREATE_MOBJ, RGW_ADDB_PHASE_START);
@@ -2746,7 +3233,9 @@ int MotrObject::create_mobj(const DoutPrefixProvider *dpp, uint64_t sz)
   m0_obj_init(mobj, &store->container.co_realm, &meta.oid, lid);
 
   struct m0_op *op = nullptr;
-  mobj->ob_entity.en_flags |= (M0_ENF_META | M0_ENF_GEN_DI);
+  mobj->ob_entity.en_flags |= M0_ENF_GEN_DI;
+  if (store_own_meta)
+    mobj->ob_entity.en_flags |= M0_ENF_META; // Motr won't store metadata if this flag is set.
   rc = m0_entity_create(nullptr, &mobj->ob_entity, &op);
   if (rc != 0) {
     ADDB(RGW_ADDB_REQUEST_ID, addb_logger.get_id(),
@@ -2822,7 +3311,9 @@ int MotrObject::open_mobj(const DoutPrefixProvider *dpp)
   struct m0_op *op = nullptr;
   mobj->ob_attr.oa_layout_id = meta.layout_id;
   mobj->ob_attr.oa_pver      = meta.pver;
-  mobj->ob_entity.en_flags  |= (M0_ENF_META | M0_ENF_GEN_DI);
+  mobj->ob_entity.en_flags  |= M0_ENF_GEN_DI;
+  if (!meta.is_composite)
+    mobj->ob_entity.en_flags |= M0_ENF_META; 
   ldpp_dout(dpp, 20) <<__func__ << ": key=" << this->get_key().to_str() << ", meta:oid=[0x" << std::hex << meta.oid.u_hi
                                  << ":0x" << meta.oid.u_lo << "], meta:pvid=[0x" << std::hex << meta.pver.f_container
                                  << ":0x" << meta.pver.f_key << "], meta:layout_id=0x" << std::hex << meta.layout_id << dendl;
@@ -2887,6 +3378,7 @@ int MotrObject::delete_mobj(const DoutPrefixProvider *dpp)
   // Create an DELETE op and execute it (sync version).
   struct m0_op *op = nullptr;
   mobj->ob_entity.en_flags |= (M0_ENF_META | M0_ENF_GEN_DI);
+  //mobj->ob_entity.en_flags |= (M0_ENF_META | M0_ENF_DI);
   rc = m0_entity_delete(&mobj->ob_entity, &op);
   if (rc != 0) {
     ldpp_dout(dpp, LOG_ERROR) <<__func__ << ": ERROR: m0_entity_delete() failed. rc=" << rc << dendl;
@@ -3045,6 +3537,7 @@ int MotrObject::write_mobj(const DoutPrefixProvider *dpp, bufferlist&& in_buffer
     ldpp_dout(dpp, 20) <<__func__ << ": Write data bytes=[" << bs << "], at offset=[" << offset << "]" << dendl;
     op = nullptr;
     this->mobj->ob_entity.en_flags |= M0_ENF_GEN_DI;
+    //this->mobj->ob_entity.en_flags |= M0_ENF_DI;
     rc = m0_obj_op(this->mobj, M0_OC_WRITE, &ext, &buf, &attr, 0, flags, &op);
     if (rc != 0) {
       ldpp_dout(dpp, LOG_ERROR) <<__func__ << ": ERROR: write failed, m0_obj_op rc="<< rc << dendl;
@@ -3147,6 +3640,7 @@ int MotrObject::read_mobj(const DoutPrefixProvider* dpp, int64_t start, int64_t 
 
     op = nullptr;
     this->mobj->ob_entity.en_flags |= M0_ENF_GEN_DI;
+    //this->mobj->ob_entity.en_flags |= M0_ENF_DI;
     rc = m0_obj_op(this->mobj, M0_OC_READ, &ext, &buf, &attr, 0, flags, &op);
     if (rc != 0) {
       ldpp_dout(dpp, LOG_ERROR) <<__func__ << ": ERROR: motr op failed: rc=" << rc << dendl;
@@ -3373,7 +3867,7 @@ int MotrObject::update_version_entries(const DoutPrefixProvider *dpp, bool set_i
   }
 
   rgw::sal::Attrs attrs;
-  MotrObject::Meta meta;
+  MotrObjectMeta meta;
 
   auto iter = bl.cbegin();
   ent.decode(iter);
@@ -3630,7 +4124,11 @@ int MotrAtomicWriter::write(bool last)
        RGW_ADDB_FUNC_WRITE, RGW_ADDB_PHASE_START);
 
   if (!obj.is_opened()) {
-    rc = obj.create_mobj(dpp, left);
+    // Create a composite object is HSM_ENABLED flag is set.
+    if (store->hsm_enabled)
+      rc = obj.create_hsm_enabled_mobj(dpp, left);
+    else
+      rc = obj.create_mobj(dpp, left);
     if (rc == -EEXIST)
       rc = obj.open_mobj(dpp);
     if (rc != 0) {
@@ -3951,6 +4449,11 @@ int MotrMultipartUpload::delete_parts(const DoutPrefixProvider *dpp, std::string
       total_size += mmpart->get_size();
       total_size_rounded += mmpart->get_size_rounded();
 
+      // If it is a composite object, as no part objects are created,
+      // no need to delete part objects.
+      if (this->hsm_enabled)
+        continue;
+
       // Delete the part object. Note that the part object is  not
       // inserted into bucket index, only the corresponding motr object
       // needs to be delete. That is why we don't call
@@ -4052,10 +4555,31 @@ struct motr_multipart_upload_info
   rgw_placement_rule dest_placement;
   string upload_id;
 
+  // A multipart upload is broken into initialisation, write
+  // and completion phases, These phases are done in
+  // separate s3 requests. And after a multipart upload is
+  // initialised, an upload may break and then resumes.
+  // Becasue of there RGW hold different in-memory
+  // MotrMultipartUpload instances at different points of
+  // time. To pass correct upload info among instances,
+  // the info is stored as an entry in a Motr index.
+  //
+  // When HSM flag is set to true, a composite object is
+  // created to store data instead of multiple 'part' objects.
+  // OID and other metadata of this composite object are
+  // needed for part writes, bucket entry update when
+  // a upload is completed and other multipart upload ops
+  // such as abort etc..
+  //
+  bool hsm_enabled = false;
+  MotrObjectMeta meta;
+
   void encode(bufferlist& bl) const {
     ENCODE_START(1, 1, bl);
     encode(dest_placement, bl);
     encode(upload_id, bl);
+    encode(hsm_enabled, bl);
+    meta.encode(bl);
     ENCODE_FINISH(bl);
   }
 
@@ -4063,6 +4587,8 @@ struct motr_multipart_upload_info
     DECODE_START(1, bl);
     decode(dest_placement, bl);
     decode(upload_id, bl);
+    decode(hsm_enabled, bl);
+    meta.decode(bl);
     DECODE_FINISH(bl);
   }
 };
@@ -4076,6 +4602,7 @@ int MotrMultipartUpload::init(const DoutPrefixProvider *dpp, optional_yield y,
   std::string oid = mp_obj.get_key();
 
   owner = _owner;
+  hsm_enabled = store->hsm_enabled;
 
   string tenant_bkt_name = get_bucket_name(bucket->get_tenant(), bucket->get_name());
   do {
@@ -4088,15 +4615,29 @@ int MotrMultipartUpload::init(const DoutPrefixProvider *dpp, optional_yield y,
     mp_obj.init(oid, upload_id);
     tmp_obj_name = mp_obj.get_meta();
 
-    std::unique_ptr<rgw::sal::Object> obj;
-    obj = bucket->get_object(rgw_obj_key(tmp_obj_name, string(), mp_ns));
+    std::unique_ptr<rgw::sal::Object> sal_obj;
+    sal_obj = bucket->get_object(rgw_obj_key(tmp_obj_name, string(), mp_ns));
+    std::unique_ptr<rgw::sal::MotrObject> obj(static_cast<rgw::sal::MotrObject *>(sal_obj.release()));
     // the meta object will be indexed with 0 size, we c
     obj->set_in_extra_data(true);
     obj->set_hash_source(oid);
 
+    // The composite object is created in multipart upload initialisation
+    // phase so the later multipart upload operations (part writes etc.)
+    // can get its meta from upload info.
+    if (store->hsm_enabled) {
+      rc = obj->create_hsm_enabled_mobj(dpp, MAX_ACC_SIZE);
+      if (rc < 0) {
+        ldpp_dout(dpp, 20) <<__func__ << ": failed to create a composite object " << dendl;
+        return rc;
+      }
+    }
+
     motr_multipart_upload_info upload_info;
     upload_info.dest_placement = dest_placement;
     upload_info.upload_id = upload_id;
+    upload_info.hsm_enabled = store->hsm_enabled;
+    upload_info.meta = obj->meta;
     bufferlist mpbl;
     encode(upload_info, mpbl);
 
@@ -4211,7 +4752,7 @@ int MotrMultipartUpload::list_parts(const DoutPrefixProvider *dpp, CephContext *
     info.decode(iter);
     rgw::sal::Attrs attrs_dummy;
     decode(attrs_dummy, iter);
-    MotrObject::Meta meta;
+    MotrObjectMeta meta;
     meta.decode(iter);
 
     ldpp_dout(dpp, 20) <<__func__ << ": part_num=" << info.num
@@ -4271,6 +4812,7 @@ int MotrMultipartUpload::complete(const DoutPrefixProvider *dpp,
   uint64_t min_part_size = cct->_conf->rgw_multipart_min_part_size;
   auto etags_iter = part_etags.begin();
   rgw::sal::Attrs &attrs = target_obj->get_attrs();
+  uint64_t prev_accounted_size = 0;
 
   do {
     ldpp_dout(dpp, 20) << __func__ << ": list_parts()" << dendl;
@@ -4356,10 +4898,32 @@ int MotrMultipartUpload::complete(const DoutPrefixProvider *dpp,
         compressed = true;
       }
 
+      // Next part
       off += part_size;
       accounted_size += part->accounted_size;
       ldpp_dout(dpp, 20) <<__func__ << ": off=" << off << ", accounted_size=" << accounted_size << dendl;
     }
+
+    // If the object is a composite object, add extents here.
+    // As the composite object is created with only one layer and
+    // all parts (extents) are written to the same layer, it makes
+    // no difference that we add the extents after all parts are
+    // written. At this moment, details of the parts are known and
+    // extents can be added in batches.
+    //
+    // As the part size is usually 10s MB, no need to create an
+    // extent for each part.
+    if (hsm_enabled) {
+      std::vector<std::pair<uint64_t, uint64_t>> exts;
+      exts.emplace_back(std::pair<uint64_t, uint64_t>(off, accounted_size - prev_accounted_size));
+      prev_accounted_size = accounted_size;
+      rgw::sal::MotrObject *tmo = static_cast<rgw::sal::MotrObject *>(target_obj);
+      rc = tmo->add_composite_layer_extents(dpp, this->meta.top_layer_oid, exts, true)? :
+           tmo->add_composite_layer_extents(dpp, this->meta.top_layer_oid, exts, false);
+      if (rc < 0)
+        return rc;
+    }
+
   } while (truncated);
   hash.Final((unsigned char *)final_etag);
 
@@ -4391,20 +4955,27 @@ int MotrMultipartUpload::complete(const DoutPrefixProvider *dpp,
   rc = this->store->do_idx_op_by_name(bucket_multipart_iname,
                                       M0_IC_GET, meta_obj->get_key().to_str(), bl);
   ldpp_dout(dpp, 20) <<__func__ << ": read entry from bucket multipart index rc=" << rc << dendl;
-  if (rc < 0) {
+  if (rc < 0)
     return rc == -ENOENT ? -ERR_NO_SUCH_UPLOAD : rc;
-  }
-  rgw::sal::Attrs temp_attrs;
+
   rgw_bucket_dir_entry ent;
   bufferlist& blr = bl;
   auto ent_iter = blr.cbegin();
   ent.decode(ent_iter);
-  decode(temp_attrs, ent_iter);
 
+  motr_multipart_upload_info upload_info;
+  bufferlist mpbl;
+  mpbl.append(ent.meta.user_data.c_str(), ent.meta.user_data.size());
+  auto mpbl_iter = mpbl.cbegin();
+  upload_info.decode(mpbl_iter);
+
+  rgw::sal::Attrs temp_attrs;
+  decode(temp_attrs, ent_iter);
   // Add tag to attrs[RGW_ATTR_TAGS] key only if temp_attrs has tagging info
   if (temp_attrs.find(RGW_ATTR_TAGS) != temp_attrs.end()) {
     attrs[RGW_ATTR_TAGS] = temp_attrs[RGW_ATTR_TAGS];
   }
+
   // Update the dir entry and insert it to the bucket index so
   // the object will be seen when listing the bucket.
   bufferlist update_bl, old_check_bl;
@@ -4416,22 +4987,22 @@ int MotrMultipartUpload::complete(const DoutPrefixProvider *dpp,
   ent.meta.mtime = ceph::real_clock::now();
   ent.meta.etag = etag;
 
-  RGWBucketInfo &info = target_obj->get_bucket()->get_info();
-
   ent.encode(update_bl);
   encode(attrs, update_bl);
-  MotrObject::Meta meta_dummy;
-  meta_dummy.encode(update_bl);
+  upload_info.meta.encode(update_bl);
+  //MotrObjectMeta meta_dummy;
+  //meta_dummy.encode(update_bl);
 
   ldpp_dout(dpp, 20) <<__func__ << ": target_obj name=" << target_obj->get_name()
                                   << " target_obj oid=" << target_obj->get_oid() << dendl;
 
-  std::unique_ptr<rgw::sal::Object> obj_ver = target_obj->get_bucket()->get_object(rgw_obj_key(target_obj->get_name()));
-  rgw::sal::MotrObject *mobj_ver = static_cast<rgw::sal::MotrObject *>(obj_ver.get());
-
   // Check for bucket versioning
   // Update existing object version entries in a bucket,
   // in case of both versioning enabled and suspended.
+  std::unique_ptr<rgw::sal::Object> obj_ver = target_obj->get_bucket()->get_object(rgw_obj_key(target_obj->get_name()));
+  rgw::sal::MotrObject *mobj_ver = static_cast<rgw::sal::MotrObject *>(obj_ver.get());
+
+  RGWBucketInfo &info = target_obj->get_bucket()->get_info();
   if (info.versioned()) {
     rc = mobj_ver->update_version_entries(dpp);
     ldpp_dout(dpp, 20) <<__func__ << ": update_version_entries, rc=" << rc << dendl;
@@ -4488,6 +5059,7 @@ int MotrMultipartUpload::get_info(const DoutPrefixProvider *dpp, optional_yield 
   meta_obj->set_in_extra_data(true);
 
   // Read the object's the multipart_upload_info.
+  ldpp_dout(dpp, 20) <<__func__ << "[sining]: read upload info " << dendl;
   bufferlist bl;
   string tenant_bkt_name = get_bucket_name(meta_obj->get_bucket()->get_tenant(), meta_obj->get_bucket()->get_name());
   string bucket_multipart_iname =
@@ -4524,7 +5096,12 @@ int MotrMultipartUpload::get_info(const DoutPrefixProvider *dpp, optional_yield 
   upload_info.decode(mpbl_iter);
   placement = upload_info.dest_placement;
   *rule = &placement;
+  this->hsm_enabled = upload_info.hsm_enabled;
+  this->meta = upload_info.meta;
 
+  ldpp_dout(dpp, 0) <<__func__ << "[sining]: meta:oid=[0x" << std::hex
+                     << meta.oid.u_hi << ":0x"
+		     << meta.oid.u_lo << "]" << dendl;
   return 0;
 }
 
@@ -4537,10 +5114,108 @@ std::unique_ptr<Writer> MotrMultipartUpload::get_writer(
 				  uint64_t part_num,
 				  const std::string& part_num_str)
 {
-  return std::make_unique<MotrMultipartWriter>(dpp, y, this,
+  if (hsm_enabled)
+    return std::make_unique<MotrMultipartCompositeWriter>(dpp, y, this,
+				 std::move(_head_obj), store, owner,
+				 obj_ctx, ptail_placement_rule, part_num, part_num_str);
+  else
+    return std::make_unique<MotrMultipartWriter>(dpp, y, this,
 				 std::move(_head_obj), store, owner,
 				 obj_ctx, ptail_placement_rule, part_num, part_num_str);
 }
+
+int MotrMultipartWriter::store_part_info(const DoutPrefixProvider *dpp,
+                                         RGWUploadPartInfo info,
+                                         std::map<std::string, bufferlist>& attrs)
+{
+  uint64_t old_part_size = 0, old_part_size_rounded = 0;
+  bool compressed;
+  int rc = rgw_compression_info_from_attrset(attrs, compressed, info.cs_info);
+  ldpp_dout(dpp, 20) <<__func__ << ": compression rc=" << rc << dendl;
+  if (rc < 0) {
+    ldpp_dout(dpp, LOG_ERROR) <<__func__ <<": ERROR: cannot get compression info" << dendl;
+    return rc;
+  }
+  	
+  ldpp_dout(dpp, 0) <<__func__ << "[sining]: encode info, attrs and meta" << dendl;
+  bufferlist bl;
+  encode(info, bl);
+  encode(attrs, bl);
+  part_obj->meta.encode(bl);
+
+  //This is a MultipartComplete operation so this should always have valid upload id.
+  string part = head_obj->get_name() + "." + upload_id;
+  char buf[32];
+  snprintf(buf, sizeof(buf), ".%08d", (int)part_num);
+  part.append(buf);
+
+  // Before updating object part index with entry for new part, check if
+  // old part exists. Perform M0_IC_GET operation on object part index.
+  ldpp_dout(dpp, 0) <<__func__ << "[sining]: check if the part info exists" << dendl;
+  string tenant_bkt_name = get_bucket_name(head_obj->get_bucket()->get_tenant(),
+                                           head_obj->get_bucket()->get_name());
+  string iname = "motr.rgw.bucket." + tenant_bkt_name + ".multiparts";
+  bufferlist old_part_check_bl;
+  rc = store->do_idx_op_by_name(iname, M0_IC_GET, part, old_part_check_bl);
+  if (rc == 0 && old_part_check_bl.length() > 0 && !part_obj->meta.is_composite) {
+    // Old part exists. Try to delete it.
+    RGWUploadPartInfo old_part_info;
+    std::map<std::string, bufferlist> dummy_attr;
+    string part_obj_name = head_obj->get_bucket()->get_name() + "." +
+                          head_obj->get_key().to_str() +
+                          ".part." + std::to_string(part_num);
+    std::unique_ptr<MotrObject> old_part_obj =
+        std::make_unique<MotrObject>(this->store, rgw_obj_key(part_obj_name), head_obj->get_bucket());
+    if (old_part_obj == nullptr)
+      return -ENOMEM;
+
+    auto bl_iter = old_part_check_bl.cbegin();
+    decode(old_part_info, bl_iter);
+    decode(dummy_attr, bl_iter);
+    old_part_obj->meta.decode(bl_iter);
+    char oid_str[M0_FID_STR_LEN];
+    snprintf(oid_str, ARRAY_SIZE(oid_str), U128X_F, U128_P(&old_part_obj->meta.oid));
+    rgw::sal::MotrObject *old_mobj = static_cast<rgw::sal::MotrObject *>(old_part_obj.get());
+    ldpp_dout(dpp, 20) <<__func__ << ": Old part with oid [" << oid_str << "] exists" << dendl;
+    old_part_size = old_part_info.accounted_size;
+    old_part_size_rounded = old_part_info.size_rounded;
+    // Delete old object
+    rc = old_mobj->delete_mobj(dpp);
+    if (rc == 0) {
+      ldpp_dout(dpp, 20) <<__func__ << ": Old part [" << part <<  "] deleted succesfully" << dendl;
+    } else {
+      ldpp_dout(dpp, 0) <<__func__ << ": Failed to delete old part [" << part <<  "], rc=" << rc << dendl;
+      return rc;
+    }
+  }
+
+  ldpp_dout(dpp, 0) <<__func__ << "[sining]: put part info into index" << dendl;
+  rc = store->do_idx_op_by_name(iname, M0_IC_PUT, part, bl);
+  if (rc < 0) {
+    ldpp_dout(dpp, 0) <<__func__ << ": failed to add part obj in part index, rc=" << rc << dendl;
+    return rc == -ENOENT ? -ERR_NO_SUCH_UPLOAD : rc;
+  }
+   
+  // update size without changing the object count
+  ldpp_dout(dpp, 0) <<__func__ << "[sining]: update bucket stats" << dendl;
+  rc = update_bucket_stats(dpp, store,
+                           head_obj->get_bucket()->get_acl_owner().get_id().to_str(),
+                           tenant_bkt_name,
+                           actual_part_size - old_part_size,
+                           info.size_rounded - old_part_size_rounded, 0, true);
+  if (rc != 0) {
+    ldpp_dout(dpp, 20) <<__func__ << ": Failed stats update for the "
+      << "obj/part=" << head_obj->get_key().to_str() << "/" << part_num
+      << ", rc=" << rc << dendl;
+    return rc;
+  }
+  ldpp_dout(dpp, 70) <<__func__ << ": Updated stats successfully for the "
+      << "obj/part=" << head_obj->get_key().to_str() << "/" << part_num
+      << ", rc=" << rc << dendl;
+
+  return 0;
+}	
+
 
 int MotrMultipartWriter::prepare(optional_yield y)
 {
@@ -4605,86 +5280,133 @@ int MotrMultipartWriter::complete(size_t accounted_size, const std::string& etag
   info.size_rounded = size_rounded;
   info.accounted_size = accounted_size;
   info.modified = real_clock::now();
-  uint64_t old_part_size = 0, old_part_size_rounded = 0;
 
-  bool compressed;
-  int rc = rgw_compression_info_from_attrset(attrs, compressed, info.cs_info);
-  ldpp_dout(dpp, 20) <<__func__ << ": compression rc=" << rc << dendl;
-  if (rc < 0) {
-    ldpp_dout(dpp, LOG_ERROR) <<__func__ <<": ERROR: cannot get compression info" << dendl;
-    return rc;
-  }
-  encode(info, bl);
-  encode(attrs, bl);
-  part_obj->meta.encode(bl);
-
-  //This is a MultipartComplete operation so this should always have valid upload id.
-  string part = head_obj->get_name() + "." + upload_id;
-  char buf[32];
-  snprintf(buf, sizeof(buf), ".%08d", (int)part_num);
-  part.append(buf);
-
-  // Before updating object part index with entry for new part, check if
-  // old part exists. Perform M0_IC_GET operation on object part index.
-  string tenant_bkt_name = get_bucket_name(head_obj->get_bucket()->get_tenant(),
-                                           head_obj->get_bucket()->get_name());
-  string iname = "motr.rgw.bucket." + tenant_bkt_name + ".multiparts";
-  bufferlist old_part_check_bl;
-  rc = store->do_idx_op_by_name(iname, M0_IC_GET, part, old_part_check_bl);
-  if (rc == 0 && old_part_check_bl.length() > 0) {
-    // Old part exists. Try to delete it.
-    RGWUploadPartInfo old_part_info;
-    std::map<std::string, bufferlist> dummy_attr;
-    string part_obj_name = head_obj->get_bucket()->get_name() + "." +
-                          head_obj->get_key().to_str() +
-                          ".part." + std::to_string(part_num);
-    std::unique_ptr<MotrObject> old_part_obj =
-        std::make_unique<MotrObject>(this->store, rgw_obj_key(part_obj_name), head_obj->get_bucket());
-    if (old_part_obj == nullptr)
-      return -ENOMEM;
-
-    auto bl_iter = old_part_check_bl.cbegin();
-    decode(old_part_info, bl_iter);
-    decode(dummy_attr, bl_iter);
-    old_part_obj->meta.decode(bl_iter);
-    char oid_str[M0_FID_STR_LEN];
-    snprintf(oid_str, ARRAY_SIZE(oid_str), U128X_F, U128_P(&old_part_obj->meta.oid));
-    rgw::sal::MotrObject *old_mobj = static_cast<rgw::sal::MotrObject *>(old_part_obj.get());
-    ldpp_dout(dpp, 20) <<__func__ << ": Old part with oid [" << oid_str << "] exists" << dendl;
-    old_part_size = old_part_info.accounted_size;
-    old_part_size_rounded = old_part_info.size_rounded;
-    // Delete old object
-    rc = old_mobj->delete_mobj(dpp);
-    if (rc == 0) {
-      ldpp_dout(dpp, 20) <<__func__ << ": Old part [" << part <<  "] deleted succesfully" << dendl;
-    } else {
-      ldpp_dout(dpp, 0) <<__func__ << ": Failed to delete old part [" << part <<  "], rc=" << rc << dendl;
-      return rc;
-    }
-  }
-
-  rc = store->do_idx_op_by_name(iname, M0_IC_PUT, part, bl);
+  int rc = store_part_info(dpp, info, attrs);
   if (rc < 0) {
     ldpp_dout(dpp, 0) <<__func__ << ": failed to add part obj in part index, rc=" << rc << dendl;
     return rc == -ENOENT ? -ERR_NO_SUCH_UPLOAD : rc;
   }
    
-  // update size without changing the object count
-  rc = update_bucket_stats(dpp, store,
-                           head_obj->get_bucket()->get_acl_owner().get_id().to_str(),
-                           tenant_bkt_name,
-                           actual_part_size - old_part_size,
-                           size_rounded - old_part_size_rounded, 0, true);
-  if (rc != 0) {
-    ldpp_dout(dpp, 20) <<__func__ << ": Failed stats update for the "
-      << "obj/part=" << head_obj->get_key().to_str() << "/" << part_num
-      << ", rc=" << rc << dendl;
-    return rc;
-  }
-  ldpp_dout(dpp, 70) <<__func__ << ": Updated stats successfully for the "
-      << "obj/part=" << head_obj->get_key().to_str() << "/" << part_num
-      << ", rc=" << rc << dendl;
+  return 0;
+}
 
+// A few notes on implementating multipart upload using composite object.
+// 1. Problems: (I) The s3 request to upload a part has a parameter 'part num'
+//    but doesn't include the part's offset in the object. But a composite
+//    object's extent has to be created with offset. We can't simply calculate
+//    the part's offset as part_num * part_size as parts may be of different
+//    sizes. (II) The native multipart upload implementation uses an index
+//    to store part info. When using composite object, a part is managed as
+//    an extent, so actually there exist 2 places storing part's details.
+//    But the HSM app uses Motr's composite object APIs to manipulate the
+//    composite object, which has no knowledge of MGW's part info index.
+//    The part info in the index and composite object's extents will be
+//    in a inconsistent state. S3 GET OBJ request will return wrong data
+//    as it uses the part info index.
+//
+// 2. Solutions:
+//    (I) Temporary solution for problem (I): only allow equal part size
+//        (except the last part) for prototype.
+//        Then the offset = part_num * part_size.
+//        
+//        Stated by AWS S3 doc, the part sizes are the same for every
+//        part except for the last one (same or smaller). Maybe we can
+//        make use of this fact to get the part size.
+//
+//    (II) Part info index is only used when uploading parts. When the
+//        upload is completed, extents will be created according to
+//        the part info stored in index. Reads from composite object
+//        don't use part info index.
+
+#define MOTR_MULTIPART_DEFAULT_PART_SIZE (15 * 1024 * 1024)
+
+int MotrMultipartCompositeWriter::prepare(optional_yield y)
+{
+  ldpp_dout(dpp, 0) <<__func__ << "[sining]: enter" << dendl;
+
+#if 0
+  if (upload == nullptr)
+    return -EINVAL;
+  MotrMultipartUpload *mupload = static_cast<MotrMultipartUpload *>(upload);
+  ldpp_dout(dpp, 0) <<__func__ << "[sining]: meta:oid=[0x" << std::hex
+                     << mupload->get_motr_obj_meta().oid.u_hi << ":0x"
+		     << mupload->get_motr_obj_meta().oid.u_lo << "]" << dendl;
+  ldpp_dout(dpp, 0) <<__func__ << "[sining]: get_meta_obj" << dendl;
+  std::unique_ptr<rgw::sal::Object> hobj = mupload->get_meta_obj();
+  if (hobj == nullptr)
+    return -ENOMEM;
+  ldpp_dout(dpp, 0) <<__func__ << "[sining]: cast head obj to pobj" << dendl;
+#endif
+
+  // part_obj here is actually a clone of the composite object.
+  RGWMPObj mp_obj(head_obj->get_key().name, upload_id);
+  std::unique_ptr<rgw::sal::Object> hobj =
+    head_obj->get_bucket()->get_object(rgw_obj_key(mp_obj.get_meta(), string(), mp_ns));
+  std::unique_ptr<MotrObject> pobj(static_cast<rgw::sal::MotrObject *>(hobj.release()));
+  part_obj = std::move(pobj);
+
+  ldpp_dout(dpp, 0) <<__func__ << "[sining]: get motr obj meta" << dendl;
+  MotrMultipartUpload *mupload = static_cast<MotrMultipartUpload *>(upload);
+  part_obj->meta = mupload->get_motr_obj_meta();
+  if (part_obj->meta.layout_id == 0)
+    return -EINVAL;
+
+  ldpp_dout(dpp, 20) <<__func__ << ": opening composite object" << dendl;
+  return part_obj->open_mobj(dpp);
+}
+
+int MotrMultipartCompositeWriter::process(bufferlist&& data, uint64_t offset)
+{
+  uint64_t part_size = MOTR_MULTIPART_DEFAULT_PART_SIZE;
+  uint64_t off_in_composite_obj = (part_num - 1)* part_size + offset;
+
+  // MotrObject::write_obj() calculates the optimal bs according to
+  // the ::chunk_io_sz. If its value is 0, it will lead to a crash
+  // in ::write_mobj(). Set the value the same as the one when
+  // creating the composite object.
+  part_obj->set_chunk_io_sz(MAX_ACC_SIZE);
+  int rc = part_obj->write_mobj(dpp, std::move(data), off_in_composite_obj);
+  if (rc == 0) {
+    actual_part_size = part_obj->get_processed_bytes();
+    ldpp_dout(dpp, 20) <<__func__ << ": actual_part_size=" << actual_part_size << dendl;
+  }
+  return rc;
+}
+
+int MotrMultipartCompositeWriter::complete(size_t accounted_size, const std::string& etag,
+                       ceph::real_time *mtime, ceph::real_time set_mtime,
+                       std::map<std::string, bufferlist>& attrs,
+                       ceph::real_time delete_at,
+                       const char *if_match, const char *if_nomatch,
+                       const std::string *user_data,
+                       rgw_zone_set *zones_trace, bool *canceled,
+                       optional_yield y)
+{
+  ldpp_dout(dpp, 20) <<__func__ << ": enter" << dendl;
+
+  RGWUploadPartInfo info;
+  info.num = part_num;
+  info.etag = etag;
+  info.size = actual_part_size;
+  uint64_t size_rounded = 0;
+  //For 0kb Object layout_id will not be available.
+  ldpp_dout(dpp, 0) <<__func__ << "[sining]: round sizes" << dendl;
+  if(info.size != 0) {
+    uint64_t lid = M0_OBJ_LAYOUT_ID(part_obj->meta.layout_id);
+    uint64_t unit_sz = m0_obj_layout_id_to_unit_size(lid);
+    size_rounded = roundup(info.size, unit_sz);
+  }
+  info.size_rounded = size_rounded;
+  info.accounted_size = accounted_size;
+  info.modified = real_clock::now();
+
+  ldpp_dout(dpp, 20) <<__func__ << "[sining]: store_part_info()" << dendl;
+  int rc = this->store_part_info(dpp, info, attrs);
+  if (rc < 0) {
+    ldpp_dout(dpp, 0) <<__func__ << ": failed to add part obj in part index, rc=" << rc << dendl;
+    return rc == -ENOENT ? -ERR_NO_SUCH_UPLOAD : rc;
+  }
+   
   return 0;
 }
 
@@ -5686,6 +6408,7 @@ void *newMotrStore(CephContext *cct)
       goto out;
     }
 
+    store->hsm_enabled = g_conf().get_val<bool>("motr_hsm_enabled");
   }
 
 out:

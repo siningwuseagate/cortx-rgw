@@ -3459,6 +3459,13 @@ options:
   default: false
   services:
   - rgw
+- name: motr_hsm_enabled
+  type: bool
+  level: advanced
+  desc: Set to true when composite object is needed to support HSM
+  default: false
+  services:
+  - rgw
 - name: rgw_luarocks_location
   type: str
   level: advanced
